@@ -1,0 +1,20 @@
+name: Daily forecast email
+on:
+  schedule:
+    - cron: "0 1 * * *"   # UTC! see timing note below
+  workflow_dispatch:       # lets you test with a manual "Run workflow" button
+
+jobs:
+  send:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install requests certifi
+      - run: python temp_forecast.py --all-cities --email
+        env:
+          GMAIL_ADDRESS: ${{ secrets.GMAIL_ADDRESS }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          TEMP_FORECAST_EMAIL_TO: ${{ secrets.TEMP_FORECAST_EMAIL_TO }}
