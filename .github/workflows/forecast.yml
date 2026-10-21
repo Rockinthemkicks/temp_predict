@@ -1,19 +1,36 @@
 name: Daily forecast email
 on:
   schedule:
-    - cron: "0 1 * * *"   # UTC! see timing note below
-  workflow_dispatch:       # lets you test with a manual "Run workflow" button
+    # Two UTC times so exactly one lands on 7 PM Denver year-round
+    # (01:00Z = 7 PM MDT, 02:00Z = 7 PM MST). The gate step skips the other.
+    - cron: "0 1 * * *"
+    - cron: "0 2 * * *"
+  workflow_dispatch:       # manual "Run workflow" button (always runs)
 
 jobs:
   send:
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     steps:
+      - name: Only continue at 7 PM Denver (scheduled runs)
+        id: gate
+        run: |
+          if [ "${{ github.event_name }}" = "schedule" ] && [ "$(TZ=America/Denver date +%H)" != "19" ]; then
+            echo "Denver hour is $(TZ=America/Denver date +%H), not 19 -- skipping."
+            echo "go=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "go=true" >> "$GITHUB_OUTPUT"
+          fi
       - uses: actions/checkout@v4
+        if: steps.gate.outputs.go == 'true'
       - uses: actions/setup-python@v5
+        if: steps.gate.outputs.go == 'true'
         with:
           python-version: "3.12"
       - run: pip install requests certifi
+        if: steps.gate.outputs.go == 'true'
       - run: python -u temp_forecast.py --all-cities --email
+        if: steps.gate.outputs.go == 'true'
         env:
           GMAIL_ADDRESS: ${{ secrets.GMAIL_ADDRESS }}
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
