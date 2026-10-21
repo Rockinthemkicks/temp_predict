@@ -13,7 +13,8 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install requests certifi
-      - run: python temp_forecast.py --all-cities --email
+#      - run: python temp_forecast.py --all-cities --email
+      - run: python -u temp_forecast.py --lat 41.98 --lon -87.90 --station KORD --email
         env:
           GMAIL_ADDRESS: ${{ secrets.GMAIL_ADDRESS }}
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
