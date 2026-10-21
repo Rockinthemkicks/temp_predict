@@ -1059,26 +1059,26 @@ def build_report(args):
 
 # Built-in city list -- edit freely, or pass your own via --cities-json.
 DEFAULT_CITIES = [
-    {"name": "Los Angeles, CA",    "lat": 34.0522, "lon": -118.2437, "station": "KVTX"},
-    {"name": "New York City, NY",  "lat": 40.7128, "lon": -74.0060,  "station": "KOKX"},
-    {"name": "Miami, FL",          "lat": 25.7617, "lon": -80.1918,  "station": "KAMX"},
-    {"name": "Chicago, IL",        "lat": 41.8781, "lon": -87.6298,  "station": "KLOT"},
-    {"name": "Dallas, TX",         "lat": 32.7767, "lon": -96.7970,  "station": "KFWS"},
-    {"name": "Austin, TX",         "lat": 30.2672, "lon": -97.7431,  "station": "KEWX"},
-    {"name": "Philadelphia, PA",   "lat": 39.9526, "lon": -75.1652,  "station": "KDIX"},
-    {"name": "Houston, TX",        "lat": 29.7604, "lon": -95.3698,  "station": "KHGX"},
-    {"name": "Denver, CO",         "lat": 39.7392, "lon": -104.9903, "station": "KFTG"},
-    {"name": "Phoenix, AZ",        "lat": 33.4484, "lon": -112.0740, "station": "KIWA"},
-    {"name": "Atlanta, GA",        "lat": 33.7490, "lon": -84.3880,  "station": "KFFC"},
-    {"name": "San Francisco, CA",  "lat": 37.7749, "lon": -122.4194, "station": "KMUX"},
-    {"name": "Minneapolis, MN",    "lat": 44.9778, "lon": -93.2650,  "station": "KMPX"},
-    {"name": "Washington, DC",     "lat": 38.9072, "lon": -77.0369,  "station": "KLWX"},
-    {"name": "Oklahoma City, OK",  "lat": 35.4676, "lon": -97.5164,  "station": "KTLX"},
-    {"name": "Seattle, WA",        "lat": 47.6062, "lon": -122.3321, "station": "KATX"},
-    {"name": "Las Vegas, NV",      "lat": 36.1699, "lon": -115.1398, "station": "KESX"},
-    {"name": "Boston, MA",         "lat": 42.3601, "lon": -71.0589,  "station": "KBOX"},
-    {"name": "New Orleans, LA",    "lat": 29.9511, "lon": -90.0715,  "station": "KLIX"},
-    {"name": "San Antonio, TX",    "lat": 29.4241, "lon": -98.4936,  "station": "KEWX"},
+    {"name": "Los Angeles, CA",    "lat": 34.0522, "lon": -118.2437, "station": "KLAX"},
+    {"name": "New York City, NY",  "lat": 40.7128, "lon": -74.0060,  "station": "KNYC"},
+    {"name": "Miami, FL",          "lat": 25.7617, "lon": -80.1918,  "station": "KMIA"},
+    {"name": "Chicago, IL",        "lat": 41.8781, "lon": -87.6298,  "station": "KORD"},
+    {"name": "Dallas, TX",         "lat": 32.7767, "lon": -96.7970,  "station": "KDFW"},
+    {"name": "Austin, TX",         "lat": 30.2672, "lon": -97.7431,  "station": "KAUS"},
+    {"name": "Philadelphia, PA",   "lat": 39.9526, "lon": -75.1652,  "station": "KPHL"},
+    {"name": "Houston, TX",        "lat": 29.7604, "lon": -95.3698,  "station": "KIAH"},
+    {"name": "Denver, CO",         "lat": 39.7392, "lon": -104.9903, "station": "KDEN"},
+    {"name": "Phoenix, AZ",        "lat": 33.4484, "lon": -112.0740, "station": "KPHX"},
+    {"name": "Atlanta, GA",        "lat": 33.7490, "lon": -84.3880,  "station": "KATL"},
+    {"name": "San Francisco, CA",  "lat": 37.7749, "lon": -122.4194, "station": "KSFO"},
+    {"name": "Minneapolis, MN",    "lat": 44.9778, "lon": -93.2650,  "station": "KMSP"},
+    {"name": "Washington, DC",     "lat": 38.9072, "lon": -77.0369,  "station": "KDCA"},
+    {"name": "Oklahoma City, OK",  "lat": 35.4676, "lon": -97.5164,  "station": "KOKC"},
+    {"name": "Seattle, WA",        "lat": 47.6062, "lon": -122.3321, "station": "KSEA"},
+    {"name": "Las Vegas, NV",      "lat": 36.1699, "lon": -115.1398, "station": "KLAS"},
+    {"name": "Boston, MA",         "lat": 42.3601, "lon": -71.0589,  "station": "KBOS"},
+    {"name": "New Orleans, LA",    "lat": 29.9511, "lon": -90.0715,  "station": "KMSY"},
+    {"name": "San Antonio, TX",    "lat": 29.4241, "lon": -98.4936,  "station": "KSAT"},
 ]
 
 
@@ -1400,6 +1400,32 @@ def format_batch_email_body(results):
         lo_str = f"{low['value_f']:.0f}F" if low else "n/a"
         lines.append(f"{r['name']:<22}{r['station']:<9}{hi_str:>7}{lo_str:>7}   {regime}")
     lines.append("-" * 70)
+
+    # Diagnostics: for any city with an n/a high or low, list which methods
+    # failed and why, so the cause is visible without digging through logs.
+    method_keys = ["persistence", "delta", "analogous_thickness", "analogous_thickness_low",
+                   "mos_error_advection", "raw_mos", "dewpoint_low"]
+    diag = []
+    for r in results:
+        rep = r["report"]
+        if rep.get("error"):
+            continue
+        syn = rep.get("synthesis", {})
+        if syn.get("high") and syn.get("low"):
+            continue
+        problems = []
+        for k in method_keys:
+            d = rep.get(k, {})
+            if d.get("error"):
+                problems.append(f"    {d.get('method', k)}: {str(d['error'])[:160]}")
+        if problems:
+            diag.append(f"  {r['name']} ({r['station']}):")
+            diag.extend(problems)
+    if diag:
+        lines.append("")
+        lines.append("DIAGNOSTICS (methods that failed for cities with an n/a):")
+        lines.extend(diag)
+
     lines.append("")
     lines.append("Run with --check-timing to see whether this run happened at a reliable time")
     lines.append("of day for the Persistence/Delta/Dewpoint methods (they depend on today's")
