@@ -70,6 +70,11 @@ import sys
 from datetime import datetime, timedelta, timezone
 from email.mime.text import MIMEText
 
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:  # Python < 3.9
+    ZoneInfo = None
+
 import requests
 
 OPEN_METEO_URL = "https://api.open-meteo.com/v1/forecast"
@@ -133,6 +138,41 @@ REGIME_WEIGHTS_TABLES = {
 # ----------------------------------------------------------------------
 # Small helpers
 # ----------------------------------------------------------------------
+
+
+# ----------------------------------------------------------------------
+# "Today" anchoring
+# ----------------------------------------------------------------------
+# The methods below treat "today" as a UTC day (00Z-24Z). That's fine when the
+# tool runs before 00Z, but a run in the local evening (e.g. 7 PM Denver =
+# 01Z the NEXT UTC day) would see a brand-new, nearly empty UTC day and
+# forecast the wrong "tomorrow". effective_now() fixes this: if the UTC date
+# has already rolled past the user's local calendar date, it returns 23:59Z
+# of the local date instead, so "today" is the just-finished UTC day (which
+# covers the full local afternoon) and "tomorrow" is the correct next day.
+# Override the zone with the TEMP_FORECAST_TZ environment variable.
+LOCAL_TZ_NAME = os.environ.get("TEMP_FORECAST_TZ", "America/Denver")
+
+
+def local_today():
+    """The user's local calendar date (default America/Denver)."""
+    now_utc = datetime.now(timezone.utc)
+    try:
+        tz = ZoneInfo(LOCAL_TZ_NAME)
+    except Exception:
+        tz = timezone(timedelta(hours=-7))  # fixed-offset fallback (MST)
+    return now_utc.astimezone(tz).date()
+
+
+def effective_now():
+    """Timezone-aware UTC 'now', held back to 23:59Z of the local date when
+    the UTC date has already moved ahead of it (see comment above)."""
+    now_utc = datetime.now(timezone.utc)
+    ldate = local_today()
+    if now_utc.date() > ldate:
+        return datetime.combine(ldate, datetime.min.time(), tzinfo=timezone.utc) \
+            + timedelta(hours=23, minutes=59)
+    return now_utc
 
 
 def c_to_f(c):
@@ -253,7 +293,7 @@ def fetch_overnight_conditions(lat, lon):
     data = fetch_open_meteo(lat, lon, ["wind_speed_10m", "cloud_cover"],
                              past_days=0, forecast_days=2, timezone_mode="UTC")
     h = data["hourly"]
-    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    now = effective_now().replace(tzinfo=None)
     tomorrow = now.date() + timedelta(days=1)
     win_start = datetime.combine(tomorrow, datetime.min.time()) + timedelta(hours=3)
     win_end = datetime.combine(tomorrow, datetime.min.time()) + timedelta(hours=12)
@@ -286,7 +326,7 @@ def fetch_asos_today(station, tz_offset_hours=0):
     can compute an actual (not model-analysis) high/low and afternoon
     dewpoint. tz_offset_hours lets you request 'local day' instead of UTC
     day; left at 0 (UTC day) by default since that's unambiguous."""
-    now = datetime.now(timezone.utc)
+    now = effective_now()
     start = now.replace(hour=0, minute=0, second=0, microsecond=0)
     params = {
         "station": station,
@@ -467,7 +507,7 @@ def find_upstream_analog(lat, lon, valid_hour_utc, search_distances_km=(150, 300
     advection strength for the pattern-regime classification.
     """
     # All datetimes here are naive-UTC on purpose (see nearest_index docstring).
-    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    now = effective_now().replace(tzinfo=None)
     target_date = now.date()
     tomorrow_valid = datetime.combine(target_date, datetime.min.time()) \
         + timedelta(days=1, hours=valid_hour_utc)
@@ -644,7 +684,7 @@ def method_raw_mos(station, model="GFS", target_date=None):
     regime; REGIME_WEIGHTS and REGIME_WEIGHTS_ALT both omit it entirely
     (defaulting to 0 -- see synthesize_forecast's w_for), so this changes
     nothing unless --regime-weights fitted is selected."""
-    tomorrow = datetime.now(timezone.utc).date() + timedelta(days=1)
+    tomorrow = effective_now().date() + timedelta(days=1)
     if target_date is None:
         target_date = tomorrow.isoformat()
 
@@ -688,7 +728,7 @@ def method_mos_error_advection(station, upstream_stations, model="GFS", target_d
                        "rather than using just one."),
         }
 
-    today = datetime.now(timezone.utc).date()
+    today = effective_now().date()
     tomorrow = today + timedelta(days=1)
     if target_date is None:
         target_date = tomorrow.isoformat()
@@ -1058,7 +1098,9 @@ def run_all_cities(cities=None, model=None, mos_model="GFS", valid_hour=18, low_
             regime_weights=regime_weights,
         )
         try:
+            print(f"Starting {city['name']}...", file=sys.stderr, flush=True)
             report = build_report(ns)
+            print(f"  finished {city['name']}", file=sys.stderr, flush=True)
         except Exception as e:
             report = {"error": str(e)}
         results.append({
@@ -1512,7 +1554,7 @@ def main():
             else:
                 print_batch_summary(results)
             if args.email:
-                today = datetime.now(timezone.utc).date().isoformat()
+                today = local_today().isoformat()
                 send_email(
                     subject=f"Tomorrow's forecast high/low -- {len(results)} cities ({today})",
                     body=format_batch_email_body(results),
@@ -1525,7 +1567,7 @@ def main():
             else:
                 print_human_report(report)
             if args.email:
-                today = datetime.now(timezone.utc).date().isoformat()
+                today = local_today().isoformat()
                 send_email(
                     subject=f"Tomorrow's forecast for {report['station']} ({today})",
                     body=render_human_report_to_string(report),
