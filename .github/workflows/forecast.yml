@@ -1,10 +1,11 @@
 name: Daily forecast email
 on:
   schedule:
-    # Two UTC times so exactly one lands on 7 PM Denver year-round
-    # (01:00Z = 7 PM MDT, 02:00Z = 7 PM MST). The gate step skips the other.
-    - cron: "0 1 * * *"
-    - cron: "0 2 * * *"
+    # Two UTC times so exactly one fires per day year-round.
+    # 01:17Z = 7:17 PM MDT (summer), 02:17Z = 7:17 PM MST (winter).
+    # Odd minute on purpose: GitHub delays runs at the top of the hour the most.
+    - cron: "17 1 * * *"
+    - cron: "17 2 * * *"
   workflow_dispatch:       # manual "Run workflow" button (always runs)
 
 jobs:
@@ -12,15 +13,22 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
-      - name: Only continue at 7 PM Denver (scheduled runs)
+      - name: Pick the run that matches current Denver time (scheduled runs)
         id: gate
+        env:
+          EVENT: ${{ github.event_name }}
+          SCHEDULE: ${{ github.event.schedule }}
         run: |
-          if [ "${{ github.event_name }}" = "schedule" ] && [ "$(TZ=America/Denver date +%H)" != "19" ]; then
-            echo "Denver hour is $(TZ=America/Denver date +%H), not 19 -- skipping."
-            echo "go=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "go=true" >> "$GITHUB_OUTPUT"
+          ZONE=$(TZ=America/Denver date +%Z)
+          echo "Event=$EVENT Schedule='$SCHEDULE' Denver zone=$ZONE"
+          GO=true
+          if [ "$EVENT" = "schedule" ]; then
+            if [ "$SCHEDULE" = "17 1 * * *" ] && [ "$ZONE" = "MDT" ]; then GO=true
+            elif [ "$SCHEDULE" = "17 2 * * *" ] && [ "$ZONE" = "MST" ]; then GO=true
+            else GO=false; echo "Not the right run for $ZONE -- skipping."
+            fi
           fi
+          echo "go=$GO" >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@v4
         if: steps.gate.outputs.go == 'true'
       - uses: actions/setup-python@v5
