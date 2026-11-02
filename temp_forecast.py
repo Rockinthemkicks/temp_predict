@@ -154,14 +154,26 @@ REGIME_WEIGHTS_TABLES = {
 LOCAL_TZ_NAME = os.environ.get("TEMP_FORECAST_TZ", "America/Denver")
 
 
+# A run that starts after local midnight (e.g. GitHub's scheduler delayed a
+# 7 PM job by 5 hours) still belongs to the previous evening: before this
+# local hour, "today" is treated as yesterday's date.
+LATE_RUN_CUTOFF_HOUR = int(os.environ.get("TEMP_FORECAST_LATE_CUTOFF", "6"))
+
+
 def local_today():
-    """The user's local calendar date (default America/Denver)."""
+    """The calendar date this run belongs to, in the user's zone (default
+    America/Denver). Runs between local midnight and LATE_RUN_CUTOFF_HOUR
+    count as the previous day's evening run."""
     now_utc = datetime.now(timezone.utc)
     try:
         tz = ZoneInfo(LOCAL_TZ_NAME)
     except Exception:
         tz = timezone(timedelta(hours=-7))  # fixed-offset fallback (MST)
-    return now_utc.astimezone(tz).date()
+    local = now_utc.astimezone(tz)
+    d = local.date()
+    if local.hour < LATE_RUN_CUTOFF_HOUR:
+        d -= timedelta(days=1)
+    return d
 
 
 def effective_now():
@@ -273,6 +285,7 @@ def fetch_daily_maxmin(lat, lon, model=None):
         "latitude": lat,
         "longitude": lon,
         "daily": "temperature_2m_max,temperature_2m_min",
+        "past_days": 1,
         "forecast_days": 3,
         "timezone": "auto",
     }
@@ -446,8 +459,14 @@ def method_delta(lat, lon, station, model=None):
     daily = fetch_daily_maxmin(lat, lon, model=model)
     if len(daily["time"]) < 2:
         raise RuntimeError("Not enough model days returned for delta method")
-    today_model_hi, tomorrow_model_hi = daily["temperature_2m_max"][0], daily["temperature_2m_max"][1]
-    today_model_lo, tomorrow_model_lo = daily["temperature_2m_min"][0], daily["temperature_2m_min"][1]
+    # Pick "today" by date (not by position) so a late-running job still
+    # compares the right two days.
+    anchor = effective_now().date().isoformat()
+    i = daily["time"].index(anchor) if anchor in daily["time"] else 0
+    if i + 1 >= len(daily["time"]):
+        i = 0
+    today_model_hi, tomorrow_model_hi = daily["temperature_2m_max"][i], daily["temperature_2m_max"][i + 1]
+    today_model_lo, tomorrow_model_lo = daily["temperature_2m_min"][i], daily["temperature_2m_min"][i + 1]
     delta_hi = tomorrow_model_hi - today_model_hi
     delta_lo = tomorrow_model_lo - today_model_lo
 
