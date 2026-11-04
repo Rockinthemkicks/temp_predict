@@ -1,0 +1,21 @@
+target_date,generated_utc,city,station,fc_high,fc_low,pattern
+2026-11-04,2026-11-04T02:12:47.696034+00:00,"Los Angeles, CA",KLAX,69,59,rapidly changing
+2026-11-04,2026-11-04T02:12:47.696034+00:00,"New York City, NY",KNYC,58,53,stagnant
+2026-11-04,2026-11-04T02:12:47.696034+00:00,"Miami, FL",KMIA,86,72,stagnant
+2026-11-04,2026-11-04T02:12:47.696034+00:00,"Chicago, IL",KORD,72,62,rapidly changing
+2026-11-04,2026-11-04T02:12:47.696034+00:00,"Dallas, TX",KDFW,48,54,rapidly changing
+2026-11-04,2026-11-04T02:12:47.696034+00:00,"Austin, TX",KAUS,,64,stagnant
+2026-11-04,2026-11-04T02:12:47.696034+00:00,"Philadelphia, PA",KPHL,70,48,stagnant
+2026-11-04,2026-11-04T02:12:47.696034+00:00,"Houston, TX",KIAH,71,68,rapidly changing
+2026-11-04,2026-11-04T02:12:47.696034+00:00,"Denver, CO",KDEN,50,33,rapidly changing
+2026-11-04,2026-11-04T02:12:47.696034+00:00,"Phoenix, AZ",KPHX,78,55,stagnant
+2026-11-04,2026-11-04T02:12:47.696034+00:00,"Atlanta, GA",KATL,69,62,moderate change
+2026-11-04,2026-11-04T02:12:47.696034+00:00,"San Francisco, CA",KSFO,63,58,rapidly changing
+2026-11-04,2026-11-04T02:12:47.696034+00:00,"Minneapolis, MN",KMSP,,54,stagnant
+2026-11-04,2026-11-04T02:12:47.696034+00:00,"Washington, DC",KDCA,72,51,stagnant
+2026-11-04,2026-11-04T02:12:47.696034+00:00,"Oklahoma City, OK",KOKC,57,52,rapidly changing
+2026-11-04,2026-11-04T02:12:47.696034+00:00,"Seattle, WA",KSEA,53,49,moderate change
+2026-11-04,2026-11-04T02:12:47.696034+00:00,"Las Vegas, NV",KLAS,62,40,rapidly changing
+2026-11-04,2026-11-04T02:12:47.696034+00:00,"Boston, MA",KBOS,,44,stagnant
+2026-11-04,2026-11-04T02:12:47.696034+00:00,"New Orleans, LA",KMSY,77,72,moderate change
+2026-11-04,2026-11-04T02:12:47.696034+00:00,"San Antonio, TX",KSAT,,58,stagnant

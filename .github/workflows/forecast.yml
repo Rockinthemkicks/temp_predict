@@ -5,6 +5,9 @@ on:
   # don't get a second, late copy.
   workflow_dispatch:
 
+permissions:
+  contents: write   # lets the run save tonight's forecast into forecasts/
+
 jobs:
   send:
     runs-on: ubuntu-latest
@@ -15,8 +18,26 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install requests certifi
-      - run: python -u temp_forecast.py --all-cities --email
+      - run: python -u temp_forecast.py --all-cities --email --save-forecasts forecasts
         env:
           GMAIL_ADDRESS: ${{ secrets.GMAIL_ADDRESS }}
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
           TEMP_FORECAST_EMAIL_TO: ${{ secrets.TEMP_FORECAST_EMAIL_TO }}
+
+      # Save the forecast even if the email step failed, so it can still be graded.
+      - name: Save forecast to repo
+        if: always()
+        run: |
+          git config user.name "forecast-bot"
+          git config user.email "forecast-bot@users.noreply.github.com"
+          git add forecasts/
+          if git diff --cached --quiet; then
+            echo "No forecast file to save."
+            exit 0
+          fi
+          git commit -m "Forecast for $(ls -t forecasts/*.csv | head -1 | xargs basename .csv)"
+          for i in 1 2 3; do
+            git pull --rebase && git push && exit 0
+            sleep 5
+          done
+          exit 1

@@ -1155,6 +1155,33 @@ def print_batch_summary(results):
     print("=" * 78)
 
 
+def save_batch_forecast_csv(results, out_dir):
+    """Write tonight's batch forecast to <out_dir>/<target date>.csv so
+    score_forecasts.py can grade it against the official NWS numbers once
+    the day is over. The target date is the day after local_today()."""
+    import csv
+    target = local_today() + timedelta(days=1)
+    os.makedirs(out_dir, exist_ok=True)
+    path = os.path.join(out_dir, f"{target.isoformat()}.csv")
+    generated = datetime.now(timezone.utc).isoformat()
+    with open(path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["target_date", "generated_utc", "city", "station", "fc_high", "fc_low", "pattern"])
+        for r in results:
+            rep = r["report"]
+            syn = {} if rep.get("error") else rep.get("synthesis", {})
+            high, low = syn.get("high"), syn.get("low")
+            regime = "error" if rep.get("error") else rep.get("pattern_regime", {}).get("regime", "")
+            w.writerow([
+                target.isoformat(), generated, r["name"], r["station"],
+                f"{high['value_f']:.0f}" if high else "",
+                f"{low['value_f']:.0f}" if low else "",
+                regime,
+            ])
+    print(f"Saved forecast for {target} to {path}", file=sys.stderr)
+    return path
+
+
 def print_human_report(report):
     def line(*a):
         print(*a)
@@ -1563,6 +1590,9 @@ def main():
                          "fit + holdout-validated on 90 days at KORD, Jun-Sep only -- see "
                          "REGIME_WEIGHTS_FITTED's comment for caveats before using this elsewhere).")
     p.add_argument("--json", action="store_true", help="Output raw JSON instead of a formatted report")
+    p.add_argument("--save-forecasts", default=None, metavar="DIR",
+                   help="With --all-cities: also save the forecast to DIR/<target date>.csv "
+                        "so score_forecasts.py can grade it later")
     p.add_argument("--email", action="store_true",
                     help="Email the results (in addition to printing them) via Gmail's SMTP relay. "
                          "Requires the GMAIL_APP_PASSWORD environment variable to be set to a Gmail "
@@ -1598,6 +1628,11 @@ def main():
                 print(json.dumps(results, indent=2, default=str))
             else:
                 print_batch_summary(results)
+            if args.save_forecasts:
+                try:
+                    save_batch_forecast_csv(results, args.save_forecasts)
+                except Exception as e:  # never let saving block the email
+                    print(f"Could not save forecast CSV: {e}", file=sys.stderr)
             if args.email:
                 today = local_today().isoformat()
                 send_email(
