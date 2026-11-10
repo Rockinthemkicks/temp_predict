@@ -139,3 +139,23 @@ target_date,city,station,pattern,fc_high,act_high,err_high,fc_low,act_low,err_lo
 2026-11-08,"Boston, MA",KBOS,rapidly changing,60,58,2,58,48,10
 2026-11-08,"New Orleans, LA",KMSY,moderate change,75,67,8,54,56,-2
 2026-11-08,"San Antonio, TX",KSAT,moderate change,64,64,0,57,60,-3
+2026-11-09,"Los Angeles, CA",KLAX,stagnant,84,86,-2,51,64,-13
+2026-11-09,"New York City, NY",KNYC,rapidly changing,55,58,-3,45,50,-5
+2026-11-09,"Miami, FL",KMIA,moderate change,81,85,-4,72,75,-3
+2026-11-09,"Chicago, IL",KORD,stagnant,61,60,1,40,39,1
+2026-11-09,"Dallas, TX",KDFW,moderate change,62,72,-10,49,55,-6
+2026-11-09,"Austin, TX",KAUS,moderate change,60,64,-4,58,59,-1
+2026-11-09,"Philadelphia, PA",KPHL,stagnant,,62,,37,48,-11
+2026-11-09,"Houston, TX",KIAH,stagnant,71,66,5,59,56,3
+2026-11-09,"Denver, CO",KDEN,stagnant,50,72,-22,30,41,-11
+2026-11-09,"Phoenix, AZ",KPHX,moderate change,51,83,-32,46,62,-16
+2026-11-09,"Atlanta, GA",KATL,stagnant,63,74,-11,46,45,1
+2026-11-09,"San Francisco, CA",KSFO,stagnant,,72,,57,54,3
+2026-11-09,"Minneapolis, MN",KMSP,stagnant,57,61,-4,40,38,2
+2026-11-09,"Washington, DC",KDCA,rapidly changing,56,66,-10,34,48,-14
+2026-11-09,"Oklahoma City, OK",KOKC,moderate change,62,71,-9,39,41,-2
+2026-11-09,"Seattle, WA",KSEA,stagnant,,55,,45,43,2
+2026-11-09,"Las Vegas, NV",KLAS,stagnant,74,73,1,43,52,-9
+2026-11-09,"Boston, MA",KBOS,rapidly changing,50,58,-8,43,48,-5
+2026-11-09,"New Orleans, LA",KMSY,moderate change,66,73,-7,59,59,0
+2026-11-09,"San Antonio, TX",KSAT,stagnant,,63,,58,57,1
