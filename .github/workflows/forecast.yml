@@ -35,7 +35,7 @@ jobs:
             echo "No forecast file to save."
             exit 0
           fi
-          git commit -m "Forecast for $(ls -t forecasts/*.csv | head -1 | xargs basename .csv)"
+          git commit -m "Forecast for $(basename "$(ls -t forecasts/*.csv | head -1)" .csv)"
           for i in 1 2 3; do
             git pull --rebase && git push && exit 0
             sleep 5

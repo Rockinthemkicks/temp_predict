@@ -219,6 +219,30 @@ def destination_point(lat, lon, bearing_deg, distance_km):
     return math.degrees(lat2), math.degrees(lon2)
 
 
+def local_hour_to_utc(local_solar_hour, lon):
+    """UTC hour at which a place at longitude `lon` reaches the given local
+    solar hour (15 = mid-afternoon, near the daily high; 6 = around dawn,
+    near the daily low)."""
+    return int(round(local_solar_hour - lon / 15.0)) % 24
+
+
+# Added Nov 2026: Analogous Thickness used to sample 18Z for the high and
+# 12Z for the low in EVERY city. 18Z is 1 PM in New York but only 10 AM in
+# Los Angeles, so in the West it read a mid-morning temperature as the day's
+# high. The scorecard showed exactly that: highs ran ~4F too cold overall,
+# 6-9F too cold in LA/Phoenix/Las Vegas/Denver, and worst on "rapidly
+# changing" days, when this method gets the most weight. "auto" now picks
+# each city's own local mid-afternoon and dawn hours.
+ANALOG_HIGH_LOCAL_HOUR = 15
+ANALOG_LOW_LOCAL_HOUR = 6
+
+
+def resolve_valid_hours(valid_hour, low_valid_hour, lon):
+    hi = local_hour_to_utc(ANALOG_HIGH_LOCAL_HOUR, lon) if valid_hour in (None, "auto") else int(valid_hour)
+    lo = local_hour_to_utc(ANALOG_LOW_LOCAL_HOUR, lon) if low_valid_hour in (None, "auto") else int(low_valid_hour)
+    return hi, lo
+
+
 def nearest_index(times, target_dt):
     """Index into an hourly ISO-8601 time list closest to target_dt.
 
@@ -234,6 +258,47 @@ def nearest_index(times, target_dt):
             best_diff = diff
             best_i = i
     return best_i
+
+
+# ----------------------------------------------------------------------
+# HTTP with retries
+# ----------------------------------------------------------------------
+# Added Nov 2026 after the scorecard showed ~11% of highs coming back n/a:
+# Iowa Mesonet answered "429 Too Many Requests" (the batch was hitting it
+# several times per city within seconds) and Open-Meteo occasionally timed
+# out. Every request now goes through http_get(), which spaces out calls to
+# Iowa Mesonet and retries 429/5xx/timeouts with growing waits.
+
+import time as _time
+
+_IEM_MIN_INTERVAL_S = float(os.environ.get("TEMP_FORECAST_IEM_INTERVAL", "1.2"))
+_last_iem_call = [0.0]
+
+
+def http_get(url, params, timeout=25, retries=4):
+    is_iem = "iastate.edu" in url
+    wait = 4.0
+    for attempt in range(retries):
+        if is_iem:
+            gap = _time.monotonic() - _last_iem_call[0]
+            if gap < _IEM_MIN_INTERVAL_S:
+                _time.sleep(_IEM_MIN_INTERVAL_S - gap)
+            _last_iem_call[0] = _time.monotonic()
+        try:
+            r = requests.get(url, params=params, timeout=timeout * (1 + 0.5 * attempt))
+            if r.status_code in (429, 500, 502, 503, 504) and attempt < retries - 1:
+                retry_after = r.headers.get("Retry-After", "")
+                _time.sleep(float(retry_after) if retry_after.isdigit() else wait)
+                wait *= 2
+                continue
+            r.raise_for_status()
+            return r
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError):
+            if attempt < retries - 1:
+                _time.sleep(wait)
+                wait *= 2
+                continue
+            raise
 
 
 # ----------------------------------------------------------------------
@@ -253,7 +318,7 @@ def fetch_open_meteo(lat, lon, hourly_vars, past_days=2, forecast_days=3,
     }
     if model:
         params["models"] = model
-    r = requests.get(OPEN_METEO_URL, params=params, timeout=25)
+    r = http_get(OPEN_METEO_URL, params, timeout=25)
     r.raise_for_status()
     return r.json()
 
@@ -270,7 +335,7 @@ def fetch_open_meteo_multi(lat_list, lon_list, hourly_vars, past_days=1,
         "forecast_days": forecast_days,
         "timezone": timezone_mode,
     }
-    r = requests.get(OPEN_METEO_URL, params=params, timeout=40)
+    r = http_get(OPEN_METEO_URL, params, timeout=40)
     r.raise_for_status()
     data = r.json()
     if isinstance(data, dict):
@@ -291,7 +356,7 @@ def fetch_daily_maxmin(lat, lon, model=None):
     }
     if model:
         params["models"] = model
-    r = requests.get(OPEN_METEO_URL, params=params, timeout=25)
+    r = http_get(OPEN_METEO_URL, params, timeout=25)
     r.raise_for_status()
     return r.json()["daily"]
 
@@ -334,7 +399,19 @@ def fetch_overnight_conditions(lat, lon):
 # ----------------------------------------------------------------------
 
 
+_ASOS_CACHE = {}
+
+
 def fetch_asos_today(station, tz_offset_hours=0):
+    """Cached wrapper: Persistence, Delta, Dewpoint and MOS Error Advection
+    all need the same obs, so fetch each station once per run."""
+    key = (station, effective_now().strftime("%Y-%m-%dT%H"))
+    if key not in _ASOS_CACHE:
+        _ASOS_CACHE[key] = _fetch_asos_today_uncached(station)
+    return _ASOS_CACHE[key]
+
+
+def _fetch_asos_today_uncached(station):
     """Pull today's raw hourly temperature/dewpoint obs for a station so we
     can compute an actual (not model-analysis) high/low and afternoon
     dewpoint. tz_offset_hours lets you request 'local day' instead of UTC
@@ -354,8 +431,7 @@ def fetch_asos_today(station, tz_offset_hours=0):
         "missing": "M",
         "trace": "T",
     }
-    r = requests.get(IEM_ASOS_URL, params=params, timeout=25)
-    r.raise_for_status()
+    r = http_get(IEM_ASOS_URL, params, timeout=25)
     lines = [ln for ln in r.text.strip().splitlines()
              if ln and not ln.startswith("station") and not ln.startswith("#")]
     temps, dewpoints = [], []
@@ -408,15 +484,19 @@ def afternoon_dewpoint(station):
 # ----------------------------------------------------------------------
 
 
+_MOS_CACHE = {}
+
+
 def fetch_mos(station, model="GFS", runtime=None):
     if model.upper() not in VALID_MOS_MODELS:
         raise ValueError(f"MOS model must be one of {sorted(VALID_MOS_MODELS)}")
     params = {"station": station, "model": model.upper()}
     if runtime:
         params["runtime"] = runtime
-    r = requests.get(IEM_MOS_URL, params=params, timeout=25)
-    r.raise_for_status()
-    return r.json()
+    key = (station, model.upper(), runtime)
+    if key not in _MOS_CACHE:
+        _MOS_CACHE[key] = http_get(IEM_MOS_URL, params, timeout=25).json()
+    return _MOS_CACHE[key]
 
 
 def mos_tmax_tmin_for_date(mos_json, date_str):
@@ -1016,6 +1096,9 @@ def build_report(args):
     report = {"generated_utc": datetime.now(timezone.utc).isoformat(), "station": args.station,
               "lat": args.lat, "lon": args.lon}
 
+    hi_hour, lo_hour = resolve_valid_hours(getattr(args, "valid_hour", None),
+                                           getattr(args, "low_valid_hour", None), args.lon)
+
     try:
         report["persistence"] = method_persistence(args.station)
     except Exception as e:
@@ -1027,13 +1110,13 @@ def build_report(args):
         report["delta"] = {"method": "Delta Method", "error": str(e)}
 
     try:
-        report["analogous_thickness"] = method_analogous_thickness(args.lat, args.lon, args.valid_hour, role="high")
+        report["analogous_thickness"] = method_analogous_thickness(args.lat, args.lon, hi_hour, role="high")
     except Exception as e:
         report["analogous_thickness"] = {"method": "Analogous Thickness (High)", "error": str(e)}
 
     try:
         report["analogous_thickness_low"] = method_analogous_thickness(
-            args.lat, args.lon, args.low_valid_hour, role="low")
+            args.lat, args.lon, lo_hour, role="low")
     except Exception as e:
         report["analogous_thickness_low"] = {"method": "Analogous Thickness (Low)", "error": str(e)}
 
@@ -1101,7 +1184,7 @@ DEFAULT_CITIES = [
 ]
 
 
-def run_all_cities(cities=None, model=None, mos_model="GFS", valid_hour=18, low_valid_hour=12,
+def run_all_cities(cities=None, model=None, mos_model="GFS", valid_hour="auto", low_valid_hour="auto",
                     dewpoint_subtract=2.0, upstream_station=None, regime_weights="current"):
     """Run build_report() for each city in the list and return a list of
     {name, station, lat, lon, report} dicts. Network/API failures for one
@@ -1155,6 +1238,158 @@ def print_batch_summary(results):
     print("=" * 78)
 
 
+# ----------------------------------------------------------------------
+# Post-processing: consistency guard + bias correction learned from the
+# morning scorecard (added Nov 2026)
+# ----------------------------------------------------------------------
+# The scorecard (score_forecasts.py) grades every forecast against the
+# official NWS high/low and stores the results in scores/history.csv. Each
+# night, before emailing, the forecast now looks back at how far off its OWN
+# uncorrected numbers have been for each city over the last few weeks and
+# nudges tonight's numbers by that amount.
+#
+# It is deliberately cautious:
+#   - learns only from "raw" (uncorrected) forecasts, so it never chases
+#     its own corrections;
+#   - starts from zero: forecasts saved before this feature (no raw_high
+#     column) are ignored, because the analog-timing fix above already
+#     removes most of the old cold bias and re-applying it would overshoot;
+#   - waits for MIN_DAYS graded days per city, shrinks small samples toward
+#     the all-city average, and never moves a number by more than MAX_SHIFT.
+
+import csv as _csv
+from pathlib import Path as _Path
+
+BIAS_WINDOW_DAYS = 21
+BIAS_MIN_DAYS = 3
+BIAS_SHRINK_GLOBAL = 10   # pseudo-samples pulling the all-city bias toward 0
+BIAS_SHRINK_CITY = 7      # pseudo-samples pulling a city's bias toward the all-city bias
+BIAS_MAX_SHIFT_F = 6.0
+MIN_HIGH_LOW_GAP_F = 2.0
+
+
+def _to_float(v):
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def learn_bias_corrections(repo_dir=None, today=None):
+    """Return {station: {"high": shift_f, "low": shift_f, "n_high": n, "n_low": n}}
+    -- the amount to ADD to tonight's raw forecast -- from saved raw forecasts
+    (forecasts/*.csv) joined with official actuals (scores/history.csv)."""
+    repo = _Path(repo_dir) if repo_dir else _Path(__file__).resolve().parent
+    hist_path = repo / "scores" / "history.csv"
+    fc_dir = repo / "forecasts"
+    if not hist_path.exists() or not fc_dir.exists():
+        return {}
+    today = today or local_today()
+    start = today - timedelta(days=BIAS_WINDOW_DAYS)
+
+    actual = {}
+    with open(hist_path, newline="") as f:
+        for h in _csv.DictReader(f):
+            actual[(h["target_date"], h["station"])] = (_to_float(h.get("act_high")), _to_float(h.get("act_low")))
+
+    errs = {"high": {}, "low": {}}
+    for path in sorted(fc_dir.glob("*.csv")):
+        with open(path, newline="") as f:
+            for r in _csv.DictReader(f):
+                if "raw_high" not in r:
+                    break  # saved before raw values were recorded
+                try:
+                    d = datetime.strptime(r["target_date"], "%Y-%m-%d").date()
+                except (KeyError, ValueError):
+                    continue
+                if d < start or d > today:
+                    continue
+                act = actual.get((r["target_date"], r["station"]))
+                if not act:
+                    continue
+                for i, k in enumerate(("high", "low")):
+                    raw, a = _to_float(r.get("raw_" + k)), act[i]
+                    if raw is not None and a is not None:
+                        errs[k].setdefault(r["station"], []).append(raw - a)
+
+    out = {}
+    for k in ("high", "low"):
+        all_e = [e for v in errs[k].values() for e in v]
+        if not all_e:
+            continue
+        g_raw = sum(all_e) / len(all_e)
+        g = g_raw * len(all_e) / (len(all_e) + BIAS_SHRINK_GLOBAL)
+        for st, v in errs[k].items():
+            if len(v) < BIAS_MIN_DAYS:
+                continue
+            m = sum(v) / len(v)
+            bias = g + (m - g) * len(v) / (len(v) + BIAS_SHRINK_CITY)
+            shift = max(-BIAS_MAX_SHIFT_F, min(BIAS_MAX_SHIFT_F, -bias))
+            out.setdefault(st, {})[k] = round(shift, 1)
+            out[st]["n_" + k] = len(v)
+    return out
+
+
+def postprocess_results(results, corrections=None):
+    """Apply learned bias corrections and the high>=low guard to every
+    city's synthesis in place. Keeps the uncorrected numbers as raw_high /
+    raw_low so the next round of learning stays honest."""
+    corrections = corrections or {}
+    for r in results:
+        rep = r["report"]
+        if rep.get("error"):
+            continue
+        syn = rep.get("synthesis") or {}
+        notes = []
+        for k in ("high", "low"):
+            part = syn.get(k)
+            syn["raw_" + k] = part["value_f"] if part else None
+            shift = corrections.get(r["station"], {}).get(k)
+            if part and shift:
+                part["value_f"] = round(part["value_f"] + shift, 1)
+                syn["correction_" + k] = shift
+        hi, lo = syn.get("high"), syn.get("low")
+        if hi and lo and hi["value_f"] < lo["value_f"] + MIN_HIGH_LOW_GAP_F:
+            # Impossible pair (e.g. Dallas 48/54 on Nov 4). Fall back to the
+            # warmest high and coolest low any method produced, and if they
+            # still cross, meet in the middle.
+            hi["value_f"] = max(hi["value_f"], hi["range_f"][1])
+            lo["value_f"] = min(lo["value_f"], lo["range_f"][0])
+            if hi["value_f"] < lo["value_f"] + MIN_HIGH_LOW_GAP_F:
+                mid = (hi["value_f"] + lo["value_f"]) / 2
+                hi["value_f"] = round(mid + MIN_HIGH_LOW_GAP_F / 2, 1)
+                lo["value_f"] = round(mid - MIN_HIGH_LOW_GAP_F / 2, 1)
+            notes.append("high/low adjusted (methods disagreed)")
+        syn["notes"] = notes
+    return results
+
+
+def _method_values(rep):
+    """Per-method numbers, saved so method weights can be re-fit from real
+    results later."""
+    def g(key, field):
+        d = rep.get(key) or {}
+        if d.get("error") or d.get("skipped"):
+            return None
+        return d.get(field)
+    return {
+        "persistence_high": g("persistence", "forecast_high_f"),
+        "persistence_low": g("persistence", "forecast_low_f"),
+        "delta_high": g("delta", "forecast_high_f"),
+        "delta_low": g("delta", "forecast_low_f"),
+        "analog_high": g("analogous_thickness", "forecast_temp_f"),
+        "analog_high_conf": g("analogous_thickness", "confidence_multiplier"),
+        "analog_low": g("analogous_thickness_low", "forecast_temp_f"),
+        "analog_low_conf": g("analogous_thickness_low", "confidence_multiplier"),
+        "mos_error_adv_high": g("mos_error_advection", "forecast_high_f"),
+        "mos_error_adv_low": g("mos_error_advection", "forecast_low_f"),
+        "raw_mos_high": g("raw_mos", "forecast_high_f"),
+        "raw_mos_low": g("raw_mos", "forecast_low_f"),
+        "dewpoint_low": g("dewpoint_low", "forecast_low_f"),
+        "dewpoint_conf": g("dewpoint_low", "confidence_weight"),
+    }
+
+
 def save_batch_forecast_csv(results, out_dir):
     """Write tonight's batch forecast to <out_dir>/<target date>.csv so
     score_forecasts.py can grade it against the official NWS numbers once
@@ -1166,18 +1401,24 @@ def save_batch_forecast_csv(results, out_dir):
     generated = datetime.now(timezone.utc).isoformat()
     with open(path, "w", newline="") as f:
         w = csv.writer(f)
-        w.writerow(["target_date", "generated_utc", "city", "station", "fc_high", "fc_low", "pattern"])
+        method_cols = list(_method_values({}).keys())
+        w.writerow(["target_date", "generated_utc", "city", "station", "fc_high", "fc_low", "pattern",
+                    "raw_high", "raw_low", "correction_high", "correction_low"] + method_cols)
+        fmt = lambda v: "" if v is None else (f"{v:.1f}" if isinstance(v, float) else str(v))
         for r in results:
             rep = r["report"]
             syn = {} if rep.get("error") else rep.get("synthesis", {})
             high, low = syn.get("high"), syn.get("low")
             regime = "error" if rep.get("error") else rep.get("pattern_regime", {}).get("regime", "")
+            mv = _method_values(rep)
             w.writerow([
                 target.isoformat(), generated, r["name"], r["station"],
                 f"{high['value_f']:.0f}" if high else "",
                 f"{low['value_f']:.0f}" if low else "",
                 regime,
-            ])
+                fmt(syn.get("raw_high")), fmt(syn.get("raw_low")),
+                fmt(syn.get("correction_high")), fmt(syn.get("correction_low")),
+            ] + [fmt(mv[c]) for c in method_cols])
     print(f"Saved forecast for {target} to {path}", file=sys.stderr)
     return path
 
@@ -1444,8 +1685,20 @@ def format_batch_email_body(results):
         regime = rep.get("pattern_regime", {}).get("regime", "n/a")
         hi_str = f"{high['value_f']:.0f}F" if high else "n/a"
         lo_str = f"{low['value_f']:.0f}F" if low else "n/a"
-        lines.append(f"{r['name']:<22}{r['station']:<9}{hi_str:>7}{lo_str:>7}   {regime}")
+        flag = " *" if syn.get("notes") else ""
+        lines.append(f"{r['name']:<22}{r['station']:<9}{hi_str:>7}{lo_str:>7}   {regime}{flag}")
     lines.append("-" * 70)
+    if any((r["report"].get("synthesis") or {}).get("notes") for r in results):
+        lines.append("* methods disagreed so much the high came out below the low; adjusted.")
+    shifted = [(r["name"], (r["report"].get("synthesis") or {}).get("correction_high"),
+                (r["report"].get("synthesis") or {}).get("correction_low"))
+               for r in results if not r["report"].get("error")]
+    shifted = [s for s in shifted if s[1] or s[2]]
+    if shifted:
+        lines.append("Learned bias corrections applied (from the scorecard): " + "; ".join(
+            f"{n.split(',')[0]} hi {h:+.0f}/lo {l:+.0f}" if h and l else
+            (f"{n.split(',')[0]} hi {h:+.0f}" if h else f"{n.split(',')[0]} lo {l:+.0f}")
+            for n, h, l in shifted))
 
     # Diagnostics: for any city with an n/a high or low, list which methods
     # failed and why, so the cause is visible without digging through logs.
@@ -1577,11 +1830,12 @@ def main():
                          "course's guidance not to rely on a single station. Run without this "
                          "first, use the Analogous Thickness output's analog lat/lon to pick "
                          "candidates, then re-run.")
-    p.add_argument("--valid-hour", type=int, default=18,
-                    help="UTC hour tomorrow to forecast for Analogous Thickness's HIGH estimate (default 18Z)")
-    p.add_argument("--low-valid-hour", type=int, default=12,
-                    help="UTC hour tomorrow morning to forecast for Analogous Thickness's LOW "
-                         "estimate (course recommends 12Z, default 12)")
+    p.add_argument("--valid-hour", default="auto",
+                    help="UTC hour tomorrow for Analogous Thickness's HIGH estimate, or 'auto' "
+                         "(default) for each city's local ~3 PM")
+    p.add_argument("--low-valid-hour", default="auto",
+                    help="UTC hour tomorrow morning for Analogous Thickness's LOW estimate, or "
+                         "'auto' (default) for each city's local ~6 AM")
     p.add_argument("--dewpoint-subtract", type=float, default=2.0,
                     help="Degrees F to subtract from afternoon dewpoint for low forecast (0-3, default 2)")
     p.add_argument("--regime-weights", default="current", choices=sorted(REGIME_WEIGHTS_TABLES),
@@ -1624,6 +1878,13 @@ def main():
                 low_valid_hour=args.low_valid_hour, dewpoint_subtract=args.dewpoint_subtract,
                 upstream_station=args.upstream_station, regime_weights=args.regime_weights,
             )
+            corrections = {}
+            if not os.environ.get("TEMP_FORECAST_NO_CORRECTION"):
+                try:
+                    corrections = learn_bias_corrections()
+                except Exception as e:
+                    print(f"Could not learn bias corrections: {e}", file=sys.stderr)
+            postprocess_results(results, corrections)
             if args.json:
                 print(json.dumps(results, indent=2, default=str))
             else:
