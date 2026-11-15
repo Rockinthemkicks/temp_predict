@@ -1,10 +1,16 @@
 name: Morning forecast scorecard
 on:
-  # 14:37 UTC = 7:37 AM Denver in winter (8:37 AM in summer). Timing isn't
-  # critical here -- if GitHub runs it late, the scorecard is just later.
+  # Main trigger: cron-job.org calls the "workflow_dispatch" API at 7:30 AM
+  # Denver every morning (same setup as the 7 PM forecast). GitHub's own
+  # schedule ran 5-9 hours late, so it's kept only as a BACKUP: if the
+  # morning trigger already emailed today, the backup run still saves any new
+  # grades but doesn't send a second email (--once-per-day).
+  workflow_dispatch:
   schedule:
-    - cron: "37 14 * * *"
-  workflow_dispatch:   # "Run workflow" button for a manual run
+    - cron: "17 19 * * *"   # backup; GitHub usually starts it in the afternoon
+
+concurrency:
+  group: scorecard        # never let the trigger and the backup run at once
 
 permissions:
   contents: write   # lets the run save grades into scores/history.csv
@@ -18,7 +24,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: python -u score_forecasts.py --email
+      - run: python -u score_forecasts.py --email --once-per-day
         env:
           GMAIL_ADDRESS: ${{ secrets.GMAIL_ADDRESS }}
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}

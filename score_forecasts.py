@@ -260,6 +260,9 @@ def send_email(subject, body, to_addr, user, password):
 def main():
     ap = argparse.ArgumentParser(description="Grade saved forecasts against official NWS highs/lows.")
     ap.add_argument("--email", action="store_true", help="email the scorecard")
+    ap.add_argument("--once-per-day", action="store_true",
+                    help="skip the email if a scorecard was already emailed today (lets a "
+                         "backup run go ahead without sending a duplicate)")
     ap.add_argument("--rescore", action="store_true",
                     help="ignore scores/history.csv and regrade every saved day (doesn't write history)")
     args = ap.parse_args()
@@ -309,6 +312,15 @@ def main():
 
     print(body)
 
+    marker = HISTORY_CSV.parent / "last_emailed.txt"
+    if args.email and args.once_per_day:
+        try:
+            if marker.read_text().strip() == today.isoformat():
+                print(f"\nScorecard already emailed today ({today}); not sending another.")
+                return
+        except FileNotFoundError:
+            pass
+
     if args.email:
         user = os.environ.get("GMAIL_ADDRESS")
         password = os.environ.get("GMAIL_APP_PASSWORD")
@@ -317,6 +329,8 @@ def main():
             sys.exit("Email requested but GMAIL_ADDRESS / GMAIL_APP_PASSWORD are not set.")
         send_email(f"Forecast scorecard -- {today:%b %d}", body, to_addr, user, password)
         print(f"\nEmailed scorecard to {to_addr}")
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(today.isoformat() + "\n")
 
 
 if __name__ == "__main__":
