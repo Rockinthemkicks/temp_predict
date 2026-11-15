@@ -129,7 +129,38 @@ REGIME_WEIGHTS_FITTED = {
     "rapidly changing":  {"persistence": 0.00, "delta": 0.00, "analog": 0.00, "mos_error_advection": 1.0,  "raw_mos": 0.0},
 }
 
+# Fitted Nov 15 2026 from the scorecard: 40 city-days (Nov 11 + Nov 13,
+# 20 cities) where every method's own number was saved and graded against
+# the official NWS high/low. Each method on its own:
+#                  HIGH MAE  bias     LOW MAE  bias
+#   Raw MOS          2.5F   +0.4       3.6F   +3.3
+#   Delta            2.7F   +0.3       3.0F   +2.2
+#   Persistence      5.0F   +2.8       4.4F   +3.3
+#   Analog           6.8F   -2.5       6.8F   -0.2
+#   Dewpoint          --     --        6.4F   -3.0
+#   old blend        3.7F              3.8F
+# Analog was the least accurate method in every regime, yet "current" gave
+# it the MOST weight on rapidly changing days; Raw MOS was the most
+# accurate and "current" gave it zero. Grid search with each day held out
+# in turn picked MOS + Delta for highs (2.4F) and MOS + Delta + a little
+# Analog/Dewpoint for lows (2.8F; their opposite biases partly cancel).
+# Too few days to fit each regime separately, so all three share one
+# table. Keys ending in _high / _low apply to that side only.
+REGIME_WEIGHTS_SCORECARD_ONE = {
+    "raw_mos": 1.0,
+    "delta_high": 0.75, "delta_low": 1.0,
+    "persistence": 0.0,
+    "analog_high": 0.1, "analog_low": 0.25,
+    "mos_error_advection": 1.0,   # only runs with --upstream-station
+    "dewpoint": 0.25,             # times the overnight wind/cloud confidence
+}
+REGIME_WEIGHTS_SCORECARD = {r: dict(REGIME_WEIGHTS_SCORECARD_ONE)
+                            for r in ("stagnant", "moderate change", "rapidly changing")}
+
+DEFAULT_REGIME_WEIGHTS = "scorecard"
+
 REGIME_WEIGHTS_TABLES = {
+    "scorecard": REGIME_WEIGHTS_SCORECARD,
     "current": REGIME_WEIGHTS,
     "alt": REGIME_WEIGHTS_ALT,
     "fitted": REGIME_WEIGHTS_FITTED,
@@ -274,22 +305,52 @@ import time as _time
 _IEM_MIN_INTERVAL_S = float(os.environ.get("TEMP_FORECAST_IEM_INTERVAL", "1.2"))
 _last_iem_call = [0.0]
 
+# Nov 15 2026: the Nov 11 run was cancelled at GitHub's 25-minute limit
+# because a slow server made each affected city wait ~3 minutes through
+# retries. Retries now draw from one shared budget for the whole run; once
+# it's spent, a failing call fails at once (that method shows n/a) so the
+# email still goes out on time.
+RETRY_BUDGET_S = float(os.environ.get("TEMP_FORECAST_RETRY_BUDGET", "240"))
+_retry_spent = [0.0]
 
-def http_get(url, params, timeout=25, retries=4):
+
+_host_failures = {}
+HOST_FAILURE_LIMIT = 4  # consecutive failed calls before a host is skipped for the rest of the run
+
+
+def http_get(url, params, timeout=20, retries=3):
+    from urllib.parse import urlparse
+    host = urlparse(url).netloc
+    if _host_failures.get(host, 0) >= HOST_FAILURE_LIMIT:
+        raise RuntimeError(f"{host} kept failing earlier in this run; skipped")
+    try:
+        r = _http_get_with_retries(url, params, timeout, retries)
+    except Exception:
+        _host_failures[host] = _host_failures.get(host, 0) + 1
+        raise
+    _host_failures[host] = 0
+    return r
+
+
+def _http_get_with_retries(url, params, timeout, retries):
     is_iem = "iastate.edu" in url
-    wait = 4.0
+    wait = 3.0
     for attempt in range(retries):
+        if attempt > 0 and _retry_spent[0] >= RETRY_BUDGET_S:
+            raise RuntimeError(f"retry time budget used up; skipped retrying {url}")
+        t0 = _time.monotonic()
         if is_iem:
             gap = _time.monotonic() - _last_iem_call[0]
             if gap < _IEM_MIN_INTERVAL_S:
                 _time.sleep(_IEM_MIN_INTERVAL_S - gap)
             _last_iem_call[0] = _time.monotonic()
         try:
-            r = requests.get(url, params=params, timeout=timeout * (1 + 0.5 * attempt))
+            r = requests.get(url, params=params, timeout=timeout)
             if r.status_code in (429, 500, 502, 503, 504) and attempt < retries - 1:
                 retry_after = r.headers.get("Retry-After", "")
-                _time.sleep(float(retry_after) if retry_after.isdigit() else wait)
+                _time.sleep(min(float(retry_after), 30) if retry_after.isdigit() else wait)
                 wait *= 2
+                _retry_spent[0] += _time.monotonic() - t0
                 continue
             r.raise_for_status()
             return r
@@ -297,6 +358,7 @@ def http_get(url, params, timeout=25, retries=4):
             if attempt < retries - 1:
                 _time.sleep(wait)
                 wait *= 2
+                _retry_spent[0] += _time.monotonic() - t0
                 continue
             raise
 
@@ -1022,11 +1084,14 @@ def synthesize_forecast(report, weights_table=None):
     regime_info = report.get("pattern_regime") or {}
     weights = weights_table.get(regime_info.get("regime"), {})
 
-    def w_for(key):
+    def w_for(key, side=None):
+        # A "<key>_high" / "<key>_low" entry overrides "<key>" for that side.
         # Fall back to equal weighting (old behavior) if regime is unknown --
         # except raw_mos, which defaults to 0 (excluded) when a table has no
         # opinion on it, since it's an optional 5th contributor outside the
         # course's five specified methods, not one of the original four.
+        if side and f"{key}_{side}" in weights:
+            return weights[f"{key}_{side}"]
         return weights.get(key, 0.0 if key == "raw_mos" else 1.0)
 
     high_contributors = []
@@ -1038,11 +1103,11 @@ def synthesize_forecast(report, weights_table=None):
             continue
         hi = d.get("forecast_high_f")
         lo = d.get("forecast_low_f")
-        weight = w_for(key)
-        if hi is not None and weight > 0:
-            high_contributors.append((d.get("method", key), hi, weight))
-        if lo is not None and weight > 0:
-            low_contributors.append((d.get("method", key), lo, weight))
+        w_hi, w_lo = w_for(key, "high"), w_for(key, "low")
+        if hi is not None and w_hi > 0:
+            high_contributors.append((d.get("method", key), hi, w_hi))
+        if lo is not None and w_lo > 0:
+            low_contributors.append((d.get("method", key), lo, w_lo))
 
     # Analogous Thickness now runs twice: once at ~18Z for the high, once at
     # ~12Z for the low (per the course's own guidance on which check-time to
@@ -1053,21 +1118,21 @@ def synthesize_forecast(report, weights_table=None):
         t = at_hi.get("forecast_temp_f")
         # confidence_multiplier combines the elevation-mismatch discount with
         # the pick-distance discount (both computed in method_analogous_thickness).
-        weight = w_for("analog") * at_hi.get("confidence_multiplier", 1.0)
+        weight = w_for("analog", "high") * at_hi.get("confidence_multiplier", 1.0)
         if t is not None and weight > 0:
             high_contributors.append((at_hi.get("method", "analogous_thickness"), t, weight))
 
     at_lo = report.get("analogous_thickness_low", {})
     if not (at_lo.get("error") or at_lo.get("skipped")):
         t = at_lo.get("forecast_temp_f")
-        weight = w_for("analog") * at_lo.get("confidence_multiplier", 1.0)
+        weight = w_for("analog", "low") * at_lo.get("confidence_multiplier", 1.0)
         if t is not None and weight > 0:
             low_contributors.append((at_lo.get("method", "analogous_thickness_low"), t, weight))
 
     dp = report.get("dewpoint_low", {})
     if not (dp.get("error") or dp.get("skipped")):
         lo = dp.get("forecast_low_f")
-        weight = dp.get("confidence_weight", 1.0)
+        weight = dp.get("confidence_weight", 1.0) * weights.get("dewpoint", 1.0)
         if lo is not None and weight > 0:
             low_contributors.append((dp.get("method", "dewpoint_low"), lo, weight))
 
@@ -1147,7 +1212,7 @@ def build_report(args):
         analog_d.get("steering_wind_speed_kmh"),
     )
 
-    weights_name = getattr(args, "regime_weights", "current") or "current"
+    weights_name = getattr(args, "regime_weights", None) or DEFAULT_REGIME_WEIGHTS
     weights_table = REGIME_WEIGHTS_TABLES.get(weights_name, REGIME_WEIGHTS)
     report["synthesis"] = synthesize_forecast(report, weights_table=weights_table)
     report["regime_weights_used"] = weights_name
@@ -1185,7 +1250,7 @@ DEFAULT_CITIES = [
 
 
 def run_all_cities(cities=None, model=None, mos_model="GFS", valid_hour="auto", low_valid_hour="auto",
-                    dewpoint_subtract=2.0, upstream_station=None, regime_weights="current"):
+                    dewpoint_subtract=2.0, upstream_station=None, regime_weights=None):
     """Run build_report() for each city in the list and return a list of
     {name, station, lat, lon, report} dicts. Network/API failures for one
     city never abort the rest -- they show up as an 'error' key on that
@@ -1197,7 +1262,7 @@ def run_all_cities(cities=None, model=None, mos_model="GFS", valid_hour="auto", 
             lat=city["lat"], lon=city["lon"], station=city["station"],
             model=model, mos_model=mos_model, valid_hour=valid_hour, low_valid_hour=low_valid_hour,
             dewpoint_subtract=dewpoint_subtract, upstream_station=upstream_station,
-            regime_weights=regime_weights,
+            regime_weights=regime_weights or DEFAULT_REGIME_WEIGHTS,
         )
         try:
             print(f"Starting {city['name']}...", file=sys.stderr, flush=True)
@@ -1275,6 +1340,40 @@ def _to_float(v):
         return None
 
 
+def blend_saved_row(row, side, weights_table=None):
+    """Re-create the uncorrected forecast for one saved CSV row from its
+    per-method numbers, using TODAY's weights. Lets the bias learner judge
+    the current blend on past days even after the weights change."""
+    table = weights_table or REGIME_WEIGHTS_TABLES[DEFAULT_REGIME_WEIGHTS]
+    weights = table.get(row.get("pattern"), {})
+    if not weights:
+        return None
+
+    def w_for(key):
+        if f"{key}_{side}" in weights:
+            return weights[f"{key}_{side}"]
+        return weights.get(key, 0.0 if key == "raw_mos" else 1.0)
+
+    parts = [
+        (row.get(f"persistence_{side}"), w_for("persistence")),
+        (row.get(f"delta_{side}"), w_for("delta")),
+        (row.get(f"mos_error_adv_{side}"), w_for("mos_error_advection")),
+        (row.get(f"raw_mos_{side}"), w_for("raw_mos")),
+        (row.get(f"analog_{side}"), w_for("analog") * (_to_float(row.get(f"analog_{side}_conf")) or 1.0)),
+    ]
+    if side == "low":
+        parts.append((row.get("dewpoint_low"),
+                      (_to_float(row.get("dewpoint_conf")) or 1.0) * weights.get("dewpoint", 1.0)))
+    num = den = 0.0
+    for v, w in parts:
+        v = _to_float(v)
+        if v is None or not w:
+            continue
+        num += v * w
+        den += w
+    return num / den if den else None
+
+
 def learn_bias_corrections(repo_dir=None, today=None):
     """Return {station: {"high": shift_f, "low": shift_f, "n_high": n, "n_low": n}}
     -- the amount to ADD to tonight's raw forecast -- from saved raw forecasts
@@ -1308,7 +1407,8 @@ def learn_bias_corrections(repo_dir=None, today=None):
                 if not act:
                     continue
                 for i, k in enumerate(("high", "low")):
-                    raw, a = _to_float(r.get("raw_" + k)), act[i]
+                    raw = blend_saved_row(r, k) if "delta_" + k in r else _to_float(r.get("raw_" + k))
+                    a = act[i]
                     if raw is not None and a is not None:
                         errs[k].setdefault(r["station"], []).append(raw - a)
 
@@ -1838,9 +1938,10 @@ def main():
                          "'auto' (default) for each city's local ~6 AM")
     p.add_argument("--dewpoint-subtract", type=float, default=2.0,
                     help="Degrees F to subtract from afternoon dewpoint for low forecast (0-3, default 2)")
-    p.add_argument("--regime-weights", default="current", choices=sorted(REGIME_WEIGHTS_TABLES),
-                    help="Which REGIME_WEIGHTS table drives the final synthesis: 'current' (default, "
-                         "hand-derived), 'alt' (slide-derived, unvalidated), or 'fitted' (empirically "
+    p.add_argument("--regime-weights", default=DEFAULT_REGIME_WEIGHTS, choices=sorted(REGIME_WEIGHTS_TABLES),
+                    help="Which REGIME_WEIGHTS table drives the final synthesis: 'scorecard' (default, "
+                         "fit from the morning scorecard's graded results), 'current' (the original "
+                         "hand-derived table), 'alt' (slide-derived, unvalidated), or 'fitted' (empirically "
                          "fit + holdout-validated on 90 days at KORD, Jun-Sep only -- see "
                          "REGIME_WEIGHTS_FITTED's comment for caveats before using this elsewhere).")
     p.add_argument("--json", action="store_true", help="Output raw JSON instead of a formatted report")
