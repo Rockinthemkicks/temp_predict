@@ -315,18 +315,29 @@ _retry_spent = [0.0]
 
 
 _host_failures = {}
-HOST_FAILURE_LIMIT = 4  # consecutive failed calls before a host is skipped for the rest of the run
+_host_paused_until = {}
+HOST_FAILURE_LIMIT = 4   # consecutive failed calls before a host is paused
+HOST_PAUSE_S = 90        # how long to leave it alone before trying again
+# Nov 23 2026: this used to skip a failing host for the REST of the run. On
+# nights when Open-Meteo stalled for a couple of minutes, every city after
+# the stall lost Delta and Analog (11 of 20 cities on Nov 20 and Nov 21),
+# and those city-days missed by ~0.2F more. Open-Meteo usually recovers
+# within a minute or two, so the host is now paused briefly instead, and
+# run_all_cities() makes a second pass for any city still missing them.
 
 
 def http_get(url, params, timeout=20, retries=3):
     from urllib.parse import urlparse
     host = urlparse(url).netloc
-    if _host_failures.get(host, 0) >= HOST_FAILURE_LIMIT:
-        raise RuntimeError(f"{host} kept failing earlier in this run; skipped")
+    if _time.monotonic() < _host_paused_until.get(host, 0.0):
+        raise RuntimeError(f"{host} kept failing just now; paused for {HOST_PAUSE_S:.0f}s")
     try:
         r = _http_get_with_retries(url, params, timeout, retries)
     except Exception:
         _host_failures[host] = _host_failures.get(host, 0) + 1
+        if _host_failures[host] >= HOST_FAILURE_LIMIT:
+            _host_paused_until[host] = _time.monotonic() + HOST_PAUSE_S
+            _host_failures[host] = 0
         raise
     _host_failures[host] = 0
     return r
@@ -872,6 +883,57 @@ def method_raw_mos(station, model="GFS", target_date=None):
 
 
 # ----------------------------------------------------------------------
+# Shadow methods (recorded for the scorecard, NOT used in the blend yet)
+# ----------------------------------------------------------------------
+# Nov 23 2026: Raw MOS above takes the max/min of MOS's 3-hourly "tmp"
+# values over the UTC calendar day. Sampling every 3 hours misses the true
+# peak and bottom of the day, which fits the scorecard: Raw MOS lows run
+# ~3F warm. MOS also publishes an official max/min ("n_x"; "txn" in the
+# National Blend of Models) for the local daytime (7 AM-7 PM) and overnight
+# (7 PM-8 AM) periods, in the rows valid at 00Z (max) and 12Z (min).
+# These are saved nightly so the next tune-up can grade them against the
+# official NWS numbers before giving them any weight.
+
+SHADOW_MOS_MODELS = {"mos_gfs_nx": "GFS", "mos_nam_nx": "NAM", "nbm": "NBS"}
+_logged_mos_fields = set()
+
+
+def _pick(row, *names):
+    for n in names:
+        for k in (n, n.upper()):
+            v = row.get(k)
+            if v not in (None, "", "M"):
+                try:
+                    return float(v)
+                except (TypeError, ValueError):
+                    pass
+    return None
+
+
+def method_mos_official_maxmin(station, model="GFS", target_date=None):
+    label = f"{model} MOS official max/min"
+    target = (datetime.strptime(target_date, "%Y-%m-%d").date() if target_date
+              else effective_now().date() + timedelta(days=1))
+    mos = fetch_mos(station, model=model)
+    data = mos.get("data", [])
+    if data and model not in _logged_mos_fields:
+        _logged_mos_fields.add(model)
+        print(f"[{model} MOS fields] {sorted(data[0].keys())}", file=sys.stderr, flush=True)
+    max_ftime = f"{target + timedelta(days=1)} 00:00"
+    min_ftime = f"{target} 12:00"
+    hi = lo = None
+    for r in data:
+        ft = str(r.get("ftime", "")).replace("T", " ")[:16]
+        if ft == max_ftime:
+            hi = _pick(r, "n_x", "txn", "x_n", "tmax")
+        elif ft == min_ftime:
+            lo = _pick(r, "n_x", "txn", "x_n", "tmin")
+    if hi is None and lo is None:
+        return {"method": label, "error": f"no max/min rows for {target} (looked for {max_ftime}, {min_ftime})"}
+    return {"method": label, "forecast_high_f": hi, "forecast_low_f": lo, "shadow": True}
+
+
+# ----------------------------------------------------------------------
 # Method 4: MOS Error Advection
 # ----------------------------------------------------------------------
 
@@ -1198,6 +1260,12 @@ def build_report(args):
     except Exception as e:
         report["raw_mos"] = {"method": "Raw MOS", "error": str(e)}
 
+    for key, mdl in SHADOW_MOS_MODELS.items():
+        try:
+            report[key] = method_mos_official_maxmin(args.station, model=mdl)
+        except Exception as e:
+            report[key] = {"method": f"{mdl} MOS official max/min", "error": str(e)}
+
     try:
         report["dewpoint_low"] = method_dewpoint_low(
             args.station, args.lat, args.lon, subtract_f=args.dewpoint_subtract)
@@ -1249,6 +1317,10 @@ DEFAULT_CITIES = [
 ]
 
 
+_RUN_STARTED = _time.monotonic()
+SECOND_PASS_DEADLINE_S = 15 * 60
+
+
 def run_all_cities(cities=None, model=None, mos_model="GFS", valid_hour="auto", low_valid_hour="auto",
                     dewpoint_subtract=2.0, upstream_station=None, regime_weights=None):
     """Run build_report() for each city in the list and return a list of
@@ -1273,7 +1345,34 @@ def run_all_cities(cities=None, model=None, mos_model="GFS", valid_hour="auto", 
         results.append({
             "name": city["name"], "station": city["station"],
             "lat": city["lat"], "lon": city["lon"], "report": report,
+            "_ns": ns,
         })
+
+    # Second pass: retry cities whose Open-Meteo methods (Delta, Analog)
+    # failed, as long as the run is still young. ASOS and MOS are cached,
+    # so this only re-asks Open-Meteo.
+    def missing_om(rep):
+        return rep.get("error") or any(
+            (rep.get(k) or {}).get("error") for k in ("delta", "analogous_thickness", "analogous_thickness_low"))
+
+    for r in results:
+        if not missing_om(r["report"]):
+            continue
+        if _time.monotonic() - _RUN_STARTED > SECOND_PASS_DEADLINE_S:
+            print("Skipping second pass: run is already long.", file=sys.stderr, flush=True)
+            break
+        _host_paused_until.clear()
+        _host_failures.clear()
+        try:
+            print(f"Retrying {r['name']} (missing Delta/Analog)...", file=sys.stderr, flush=True)
+            again = build_report(r["_ns"])
+            if not missing_om(again) or (r["report"].get("error") and not again.get("error")):
+                r["report"] = again
+                print(f"  recovered {r['name']}", file=sys.stderr, flush=True)
+        except Exception as e:
+            print(f"  retry failed for {r['name']}: {e}", file=sys.stderr, flush=True)
+    for r in results:
+        r.pop("_ns", None)
     return results
 
 
@@ -1487,6 +1586,12 @@ def _method_values(rep):
         "raw_mos_low": g("raw_mos", "forecast_low_f"),
         "dewpoint_low": g("dewpoint_low", "forecast_low_f"),
         "dewpoint_conf": g("dewpoint_low", "confidence_weight"),
+        "mos_gfs_nx_high": g("mos_gfs_nx", "forecast_high_f"),
+        "mos_gfs_nx_low": g("mos_gfs_nx", "forecast_low_f"),
+        "mos_nam_nx_high": g("mos_nam_nx", "forecast_high_f"),
+        "mos_nam_nx_low": g("mos_nam_nx", "forecast_low_f"),
+        "nbm_high": g("nbm", "forecast_high_f"),
+        "nbm_low": g("nbm", "forecast_low_f"),
     }
 
 
