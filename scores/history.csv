@@ -419,3 +419,23 @@ target_date,city,station,pattern,fc_high,act_high,err_high,fc_low,act_low,err_lo
 2026-11-23,"Boston, MA",KBOS,moderate change,62,69,-7,50,48,2
 2026-11-23,"New Orleans, LA",KMSY,rapidly changing,71,68,3,62,58,4
 2026-11-23,"San Antonio, TX",KSAT,rapidly changing,65,64,1,50,47,3
+2026-11-24,"Los Angeles, CA",KLAX,moderate change,70,74,-4,54,52,2
+2026-11-24,"New York City, NY",KNYC,rapidly changing,59,51,8,44,39,5
+2026-11-24,"Miami, FL",KMIA,moderate change,79,79,0,67,68,-1
+2026-11-24,"Chicago, IL",KORD,rapidly changing,39,42,-3,27,25,2
+2026-11-24,"Dallas, TX",KDFW,moderate change,52,47,5,35,41,-6
+2026-11-24,"Austin, TX",KAUS,moderate change,56,53,3,42,42,0
+2026-11-24,"Philadelphia, PA",KPHL,rapidly changing,61,54,7,45,39,6
+2026-11-24,"Houston, TX",KIAH,moderate change,64,60,4,47,44,3
+2026-11-24,"Denver, CO",KDEN,moderate change,48,53,-5,22,18,4
+2026-11-24,"Phoenix, AZ",KPHX,rapidly changing,71,74,-3,47,48,-1
+2026-11-24,"Atlanta, GA",KATL,moderate change,62,65,-3,52,45,7
+2026-11-24,"San Francisco, CA",KSFO,moderate change,58,62,-4,48,45,3
+2026-11-24,"Minneapolis, MN",KMSP,moderate change,36,34,2,16,18,-2
+2026-11-24,"Washington, DC",KDCA,rapidly changing,62,53,9,44,40,4
+2026-11-24,"Oklahoma City, OK",KOKC,moderate change,45,42,3,29,31,-2
+2026-11-24,"Seattle, WA",KSEA,moderate change,54,60,-6,44,44,0
+2026-11-24,"Las Vegas, NV",KLAS,rapidly changing,60,63,-3,42,43,-1
+2026-11-24,"Boston, MA",KBOS,rapidly changing,59,48,11,44,34,10
+2026-11-24,"New Orleans, LA",KMSY,moderate change,62,59,3,57,55,2
+2026-11-24,"San Antonio, TX",KSAT,moderate change,58,54,4,42,41,1
