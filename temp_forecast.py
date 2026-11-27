@@ -157,10 +157,37 @@ REGIME_WEIGHTS_SCORECARD_ONE = {
 REGIME_WEIGHTS_SCORECARD = {r: dict(REGIME_WEIGHTS_SCORECARD_ONE)
                             for r in ("stagnant", "moderate change", "rapidly changing")}
 
+# Nov 27 2026 -- refit after the National Blend of Models (NBM) and GFS
+# MOS's official max/min ("n_x") were recorded for a few nights. On the two
+# graded days with them (Nov 24-25, 40 city-days), each on its own:
+#                         HIGH MAE  bias    LOW MAE  bias
+#   NBM                      1.8F   -0.1      1.4F   +0.3
+#   GFS MOS official n_x     2.0F   +0.2      2.7F   +0.9
+#   Raw MOS (3-hourly tmp)   3.0F   +0.4      3.4F   +2.5
+#   Delta                    3.9F   +1.5      4.3F   +3.1
+#   Nov 15 blend (emailed)   3.4F             2.8F
+# NBM was best or tied for best on both days, highs and lows. Best blends,
+# rounded the way the email rounds: highs = NBM + a little GFS n_x + a
+# little Raw MOS (1.5F); lows = NBM + a little GFS n_x (1.4F). The older
+# methods keep a token weight only so there's still a number if every MOS
+# source is down. Two days is a small sample, so the previous table stays
+# available as --regime-weights scorecard_nov15.
+REGIME_WEIGHTS_NBM_ONE = {
+    "nbm": 1.0,
+    "mos_gfs_nx": 0.25,
+    "raw_mos_high": 0.25, "raw_mos_low": 0.0,
+    "delta": 0.02, "persistence": 0.0,
+    "analog": 0.02, "dewpoint": 0.0,
+    "mos_error_advection": 0.0,
+}
+REGIME_WEIGHTS_NBM = {r: dict(REGIME_WEIGHTS_NBM_ONE)
+                      for r in ("stagnant", "moderate change", "rapidly changing")}
+
 DEFAULT_REGIME_WEIGHTS = "scorecard"
 
 REGIME_WEIGHTS_TABLES = {
-    "scorecard": REGIME_WEIGHTS_SCORECARD,
+    "scorecard": REGIME_WEIGHTS_NBM,
+    "scorecard_nov15": REGIME_WEIGHTS_SCORECARD,
     "current": REGIME_WEIGHTS,
     "alt": REGIME_WEIGHTS_ALT,
     "fitted": REGIME_WEIGHTS_FITTED,
@@ -894,7 +921,9 @@ def method_raw_mos(station, model="GFS", target_date=None):
 # These are saved nightly so the next tune-up can grade them against the
 # official NWS numbers before giving them any weight.
 
-SHADOW_MOS_MODELS = {"mos_gfs_nx": "GFS", "mos_nam_nx": "NAM", "nbm": "NBS"}
+# Nov 27 2026: graded and promoted into the blend (see REGIME_WEIGHTS_NBM).
+# NAM MOS returned no data from IEM on any night, so it was dropped.
+SHADOW_MOS_MODELS = {"mos_gfs_nx": "GFS", "nbm": "NBS"}
 _logged_mos_fields = set()
 
 
@@ -930,7 +959,9 @@ def method_mos_official_maxmin(station, model="GFS", target_date=None):
             lo = _pick(r, "n_x", "txn", "x_n", "tmin")
     if hi is None and lo is None:
         return {"method": label, "error": f"no max/min rows for {target} (looked for {max_ftime}, {min_ftime})"}
-    return {"method": label, "forecast_high_f": hi, "forecast_low_f": lo, "shadow": True}
+    if model.upper() == "NBS":
+        label = "National Blend of Models"
+    return {"method": label, "forecast_high_f": hi, "forecast_low_f": lo}
 
 
 # ----------------------------------------------------------------------
@@ -1128,6 +1159,11 @@ def assess_pattern_regime(model_delta_hi_f, model_delta_lo_f, steering_speed_kmh
 # ----------------------------------------------------------------------
 
 
+# Methods a weights table must name explicitly to use (older tables that
+# predate them give them 0 weight rather than the default 1).
+OPTIONAL_METHODS = {"raw_mos", "nbm", "mos_gfs_nx"}
+
+
 def synthesize_forecast(report, weights_table=None):
     """Combine whichever methods produced usable numbers into a single
     weighted best-estimate high/low. Unlike a plain average, each method's
@@ -1154,12 +1190,12 @@ def synthesize_forecast(report, weights_table=None):
         # course's five specified methods, not one of the original four.
         if side and f"{key}_{side}" in weights:
             return weights[f"{key}_{side}"]
-        return weights.get(key, 0.0 if key == "raw_mos" else 1.0)
+        return weights.get(key, 0.0 if key in OPTIONAL_METHODS else 1.0)
 
     high_contributors = []
     low_contributors = []
 
-    for key in ["persistence", "delta", "mos_error_advection", "raw_mos"]:
+    for key in ["persistence", "delta", "mos_error_advection", "raw_mos", "nbm", "mos_gfs_nx"]:
         d = report.get(key, {})
         if d.get("error") or d.get("skipped"):
             continue
@@ -1451,9 +1487,17 @@ def blend_saved_row(row, side, weights_table=None):
     def w_for(key):
         if f"{key}_{side}" in weights:
             return weights[f"{key}_{side}"]
-        return weights.get(key, 0.0 if key == "raw_mos" else 1.0)
+        return weights.get(key, 0.0 if key in OPTIONAL_METHODS else 1.0)
+
+    # A row saved before a weighted method was recorded can't show how
+    # today's blend would have done, so it's skipped.
+    for key, col in (("nbm", "nbm_high"), ("mos_gfs_nx", "mos_gfs_nx_high")):
+        if w_for(key) > 0 and col not in row:
+            return None
 
     parts = [
+        (row.get(f"nbm_{side}"), w_for("nbm")),
+        (row.get(f"mos_gfs_nx_{side}"), w_for("mos_gfs_nx")),
         (row.get(f"persistence_{side}"), w_for("persistence")),
         (row.get(f"delta_{side}"), w_for("delta")),
         (row.get(f"mos_error_adv_{side}"), w_for("mos_error_advection")),
@@ -1588,8 +1632,6 @@ def _method_values(rep):
         "dewpoint_conf": g("dewpoint_low", "confidence_weight"),
         "mos_gfs_nx_high": g("mos_gfs_nx", "forecast_high_f"),
         "mos_gfs_nx_low": g("mos_gfs_nx", "forecast_low_f"),
-        "mos_nam_nx_high": g("mos_nam_nx", "forecast_high_f"),
-        "mos_nam_nx_low": g("mos_nam_nx", "forecast_low_f"),
         "nbm_high": g("nbm", "forecast_high_f"),
         "nbm_low": g("nbm", "forecast_low_f"),
     }
@@ -1638,7 +1680,7 @@ def print_human_report(report):
     line("=" * 70)
 
     for key in ["persistence", "delta", "analogous_thickness", "analogous_thickness_low",
-                "mos_error_advection", "raw_mos", "dewpoint_low"]:
+                "mos_error_advection", "raw_mos", "nbm", "mos_gfs_nx", "dewpoint_low"]:
         d = report.get(key, {})
         line()
         line(f"--- {d.get('method', key)} ---")
@@ -1908,7 +1950,7 @@ def format_batch_email_body(results):
     # Diagnostics: for any city with an n/a high or low, list which methods
     # failed and why, so the cause is visible without digging through logs.
     method_keys = ["persistence", "delta", "analogous_thickness", "analogous_thickness_low",
-                   "mos_error_advection", "raw_mos", "dewpoint_low"]
+                   "mos_error_advection", "raw_mos", "nbm", "mos_gfs_nx", "dewpoint_low"]
     diag = []
     for r in results:
         rep = r["report"]
