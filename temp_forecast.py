@@ -965,6 +965,164 @@ def method_mos_official_maxmin(station, model="GFS", target_date=None):
 
 
 # ----------------------------------------------------------------------
+# Precipitation (added Nov 27 2026)
+# ----------------------------------------------------------------------
+# Forecasts tomorrow's total precipitation (inches, liquid equivalent --
+# melted snow counts) and the chance of measurable precipitation (0.01"+),
+# for the same calendar day the official NWS Daily Climate Report uses:
+# midnight to midnight LOCAL STANDARD TIME, all year.
+#
+# Three sources, all already used elsewhere in this script:
+#   - National Blend of Models (IEM "NBS"): 6-hour amounts in hundredths of
+#     an inch (q06 = 46 means 0.46") and 6/12-hour chances (p06, p12).
+#   - GFS MOS: 6-hour amounts as CATEGORIES (q06 = 0 none, 1 = 0.01-0.09",
+#     2 = 0.10-0.24", 3 = 0.25-0.49", 4 = 0.50-0.99", 5 = 1.00-1.99",
+#     6 = 2.00"+) and 6/12-hour chances.
+#   - Open-Meteo: daily precipitation_sum and precipitation_probability_max.
+# MOS 6-hour periods end at 00/06/12/18Z, which don't line up exactly with
+# local midnight, so each period's amount is counted in proportion to how
+# much of it falls inside the local day.
+#
+# Starting weights favor NBM (the source that won on temperature); they're
+# meant to be refit from the scorecard once enough wet days are graded.
+
+# Hours behind UTC in local STANDARD time (what the climate report uses).
+CITY_STD_UTC_OFFSET = {
+    "KLAX": 8, "KSFO": 8, "KSEA": 8, "KLAS": 8, "KPHX": 7, "KDEN": 7,
+    "KDFW": 6, "KAUS": 6, "KIAH": 6, "KSAT": 6, "KOKC": 6, "KMSP": 6,
+    "KORD": 6, "KMSY": 6,
+    "KNYC": 5, "KPHL": 5, "KDCA": 5, "KBOS": 5, "KATL": 5, "KMIA": 5,
+}
+
+GFS_QPF_CATEGORY_INCHES = {0: 0.0, 1: 0.04, 2: 0.17, 3: 0.37, 4: 0.72, 5: 1.4, 6: 2.5}
+
+PRECIP_WEIGHTS = {
+    "amount": {"nbm": 1.0, "open_meteo": 0.5, "gfs_mos": 0.5},
+    "chance": {"nbm": 1.0, "open_meteo": 0.5, "gfs_mos": 0.5},
+}
+
+
+def std_offset_hours(station, lon):
+    return CITY_STD_UTC_OFFSET.get(station, int(round(-lon / 15.0)))
+
+
+def _local_day_window_utc(target, offset_h):
+    start = datetime(target.year, target.month, target.day, tzinfo=timezone.utc) + timedelta(hours=offset_h)
+    return start, start + timedelta(days=1)
+
+
+def _mos_precip_for_day(rows, target, offset_h, amount_from_row):
+    """Sum 6-hour MOS amounts over the local day (pro-rated at the edges)
+    and take the highest 12-hour chance that overlaps it."""
+    win_start, win_end = _local_day_window_utc(target, offset_h)
+    total, covered, chances = 0.0, 0.0, []
+    for r in rows:
+        try:
+            end = datetime.strptime(str(r.get("ftime"))[:16].replace("T", " "), "%Y-%m-%d %H:%M").replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+        for hours, chance_key in ((6, "p06"), (12, "p12")):
+            start = end - timedelta(hours=hours)
+            overlap = (min(end, win_end) - max(start, win_start)).total_seconds() / 3600.0
+            if overlap <= 0:
+                continue
+            if hours == 6:
+                amt = amount_from_row(r)
+                if amt is not None:
+                    total += amt * overlap / 6.0
+                    covered += overlap
+            c = _pick(r, chance_key)
+            if c is not None:
+                chances.append(c)
+    if covered < 18:  # less than 3/4 of the day has 6-hour amounts
+        return None, (max(chances) if chances else None)
+    return round(total * 24.0 / covered, 3), (max(chances) if chances else None)
+
+
+def method_precip_nbm(station, lon, target):
+    rows = fetch_mos(station, model="NBS").get("data", [])
+    def amt(r):
+        q = _pick(r, "q06")
+        return None if q is None else q / 100.0
+    a, c = _mos_precip_for_day(rows, target, std_offset_hours(station, lon), amt)
+    if a is None and c is None:
+        return {"method": "National Blend of Models (precip)", "error": f"no 6-hour periods for {target}"}
+    return {"method": "National Blend of Models (precip)", "amount_in": a, "chance_pct": c}
+
+
+def method_precip_gfs_mos(station, lon, target):
+    rows = fetch_mos(station, model="GFS").get("data", [])
+    def amt(r):
+        q = _pick(r, "q06")
+        return None if q is None else GFS_QPF_CATEGORY_INCHES.get(int(q), 0.0)
+    a, c = _mos_precip_for_day(rows, target, std_offset_hours(station, lon), amt)
+    if a is None and c is None:
+        return {"method": "GFS MOS (precip)", "error": f"no 6-hour periods for {target}"}
+    return {"method": "GFS MOS (precip)", "amount_in": a, "chance_pct": c}
+
+
+def method_precip_open_meteo(station, lat, lon, target):
+    params = {
+        "latitude": lat, "longitude": lon,
+        "daily": "precipitation_sum,precipitation_probability_max",
+        "precipitation_unit": "inch",
+        # Etc/GMT+N means N hours BEHIND UTC (the sign is inverted on purpose).
+        "timezone": f"Etc/GMT+{std_offset_hours(station, lon)}",
+        "forecast_days": 3,
+    }
+    daily = http_get(OPEN_METEO_URL, params, timeout=20).json().get("daily", {})
+    times = daily.get("time", [])
+    if target.isoformat() not in times:
+        return {"method": "Open-Meteo (precip)", "error": f"{target} not in Open-Meteo daily output"}
+    i = times.index(target.isoformat())
+    a = (daily.get("precipitation_sum") or [None] * len(times))[i]
+    c = (daily.get("precipitation_probability_max") or [None] * len(times))[i]
+    return {"method": "Open-Meteo (precip)", "amount_in": a, "chance_pct": c}
+
+
+def synthesize_precip(methods, weights=None):
+    weights = weights or PRECIP_WEIGHTS
+    out = {}
+    for field, wkey in (("amount_in", "amount"), ("chance_pct", "chance")):
+        num = den = 0.0
+        used = []
+        for key, d in methods.items():
+            v = d.get(field) if not d.get("error") else None
+            w = weights[wkey].get(key, 0.0)
+            if v is None or w <= 0:
+                continue
+            num += float(v) * w
+            den += w
+            used.append(key)
+        out[field] = round(num / den, 3 if field == "amount_in" else 0) if den else None
+        out[field.split("_")[0] + "_sources"] = used
+    return out
+
+
+def build_precip(station, lat, lon, target=None):
+    target = target or (effective_now().date() + timedelta(days=1))
+    methods = {}
+    for key, fn in (("nbm", lambda: method_precip_nbm(station, lon, target)),
+                    ("gfs_mos", lambda: method_precip_gfs_mos(station, lon, target)),
+                    ("open_meteo", lambda: method_precip_open_meteo(station, lat, lon, target))):
+        try:
+            methods[key] = fn()
+        except Exception as e:
+            methods[key] = {"method": key, "error": str(e)}
+    return {"target_date": target.isoformat(), "methods": methods, "synthesis": synthesize_precip(methods)}
+
+
+def format_precip(p):
+    """'0.25" 70%' style text for the email."""
+    syn = (p or {}).get("synthesis") or {}
+    a, c = syn.get("amount_in"), syn.get("chance_pct")
+    if a is None and c is None:
+        return "n/a"
+    a_txt = "0" if a is not None and a < 0.005 else (f'{a:.2f}"' if a is not None else "?")
+    return f"{a_txt} {c:.0f}%" if c is not None else a_txt
+
+
+# ----------------------------------------------------------------------
 # Method 4: MOS Error Advection
 # ----------------------------------------------------------------------
 
@@ -1321,6 +1479,11 @@ def build_report(args):
     report["synthesis"] = synthesize_forecast(report, weights_table=weights_table)
     report["regime_weights_used"] = weights_name
 
+    try:
+        report["precip"] = build_precip(args.station, args.lat, args.lon)
+    except Exception as e:
+        report["precip"] = {"error": str(e)}
+
     return report
 
 
@@ -1634,6 +1797,22 @@ def _method_values(rep):
         "mos_gfs_nx_low": g("mos_gfs_nx", "forecast_low_f"),
         "nbm_high": g("nbm", "forecast_high_f"),
         "nbm_low": g("nbm", "forecast_low_f"),
+        **_precip_values(rep),
+    }
+
+
+def _precip_values(rep):
+    p = rep.get("precip") or {}
+    syn = p.get("synthesis") or {}
+    m = p.get("methods") or {}
+    def g(key, field):
+        d = m.get(key) or {}
+        return None if d.get("error") else d.get(field)
+    return {
+        "fc_precip": syn.get("amount_in"), "fc_pop": syn.get("chance_pct"),
+        "nbm_precip": g("nbm", "amount_in"), "nbm_pop": g("nbm", "chance_pct"),
+        "gfs_precip": g("gfs_mos", "amount_in"), "gfs_pop": g("gfs_mos", "chance_pct"),
+        "om_precip": g("open_meteo", "amount_in"), "om_pop": g("open_meteo", "chance_pct"),
     }
 
 
@@ -1651,7 +1830,12 @@ def save_batch_forecast_csv(results, out_dir):
         method_cols = list(_method_values({}).keys())
         w.writerow(["target_date", "generated_utc", "city", "station", "fc_high", "fc_low", "pattern",
                     "raw_high", "raw_low", "correction_high", "correction_low"] + method_cols)
-        fmt = lambda v: "" if v is None else (f"{v:.1f}" if isinstance(v, float) else str(v))
+        def fmt(v):
+            if v is None:
+                return ""
+            if isinstance(v, float):
+                return f"{v:.3f}".rstrip("0").rstrip(".") or "0"
+            return str(v)
         for r in results:
             rep = r["report"]
             syn = {} if rep.get("error") else rep.get("synthesis", {})
@@ -1916,16 +2100,16 @@ def render_human_report_to_string(report):
 
 def format_batch_email_body(results):
     lines = []
-    lines.append(f"Tomorrow's most likely high/low -- generated {datetime.now(timezone.utc).isoformat()}")
+    lines.append(f"Tomorrow's most likely high/low and precipitation -- generated {datetime.now(timezone.utc).isoformat()}")
     lines.append(f"{len(results)} cities -- regime-weighted combination of every method that")
     lines.append("produced a usable number for that city.")
     lines.append("")
-    lines.append(f"{'City':<22}{'Station':<9}{'High':>7}{'Low':>7}   Pattern")
+    lines.append(f"{'City':<22}{'Station':<9}{'High':>7}{'Low':>7}  {'Precip':<11}Pattern")
     lines.append("-" * 70)
     for r in results:
         rep = r["report"]
         if rep.get("error"):
-            lines.append(f"{r['name']:<22}{r['station']:<9}{'n/a':>7}{'n/a':>7}   ERROR: {rep['error']}")
+            lines.append(f"{r['name']:<22}{r['station']:<9}{'n/a':>7}{'n/a':>7}  {'n/a':<11}ERROR: {rep['error']}")
             continue
         syn = rep.get("synthesis", {})
         high, low = syn.get("high"), syn.get("low")
@@ -1933,8 +2117,11 @@ def format_batch_email_body(results):
         hi_str = f"{high['value_f']:.0f}F" if high else "n/a"
         lo_str = f"{low['value_f']:.0f}F" if low else "n/a"
         flag = " *" if syn.get("notes") else ""
-        lines.append(f"{r['name']:<22}{r['station']:<9}{hi_str:>7}{lo_str:>7}   {regime}{flag}")
+        pr = format_precip(rep.get("precip"))
+        lines.append(f"{r['name']:<22}{r['station']:<9}{hi_str:>7}{lo_str:>7}  {pr:<11}{regime}{flag}")
     lines.append("-" * 70)
+    lines.append('Precip = expected total in inches (rain + melted snow), then the chance of')
+    lines.append('at least 0.01". "0" means none expected.')
     if any((r["report"].get("synthesis") or {}).get("notes") for r in results):
         lines.append("* methods disagreed so much the high came out below the low; adjusted.")
     shifted = [(r["name"], (r["report"].get("synthesis") or {}).get("correction_high"),

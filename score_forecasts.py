@@ -44,12 +44,38 @@ PAUSE_BETWEEN_REQUESTS = 1.5  # seconds -- IEM returns 429 if hit too fast
 BIG_MISS = 8                  # degrees F; flagged in the scorecard
 
 HISTORY_FIELDS = ["target_date", "city", "station", "pattern",
-                  "fc_high", "act_high", "err_high", "fc_low", "act_low", "err_low"]
+                  "fc_high", "act_high", "err_high", "fc_low", "act_low", "err_low",
+                  "fc_precip", "fc_pop", "act_precip", "err_precip"]
+
+# Precipitation (added Nov 27 2026). The climate report says "T" for a
+# trace (less than 0.01"), stored here as 0.001 so it counts as "some, but
+# not measurable". A day counts as wet at 0.01"+, and a forecast "calls" a
+# wet day when its chance is 50%+.
+TRACE_IN = 0.001
+WET_IN = 0.01
+WET_CALL_PCT = 50
 
 
 # --------------------------------------------------------------------------- #
 # Helpers
 # --------------------------------------------------------------------------- #
+def to_precip(v):
+    if v in ("T", "t"):
+        return TRACE_IN
+    try:
+        return round(float(v), 3)
+    except (TypeError, ValueError):
+        return None  # "M" (missing), blank
+
+
+def fmt_in(v):
+    if v is None:
+        return "n/a"
+    if 0 < v < WET_IN:
+        return "T"
+    return "0" if v == 0 else f'{v:.2f}"'
+
+
 def to_int(v):
     try:
         return int(round(float(v)))
@@ -96,12 +122,24 @@ def append_history(rows):
         return
     HISTORY_CSV.parent.mkdir(parents=True, exist_ok=True)
     new_file = not HISTORY_CSV.exists()
+    if not new_file:
+        # Older history files predate the precipitation columns: rewrite
+        # them once with the new header (old rows get blanks there).
+        with open(HISTORY_CSV, newline="") as f:
+            reader = csv.DictReader(f)
+            old_fields, old_rows = reader.fieldnames, list(reader)
+        if old_fields != HISTORY_FIELDS:
+            with open(HISTORY_CSV, "w", newline="") as f:
+                w = csv.DictWriter(f, fieldnames=HISTORY_FIELDS)
+                w.writeheader()
+                for r in old_rows:
+                    w.writerow({k: r.get(k, "") for k in HISTORY_FIELDS})
     with open(HISTORY_CSV, "a", newline="") as f:
         w = csv.DictWriter(f, fieldnames=HISTORY_FIELDS)
         if new_file:
             w.writeheader()
         for r in rows:
-            w.writerow({k: ("" if r[k] is None else r[k]) for k in HISTORY_FIELDS})
+            w.writerow({k: ("" if r.get(k) is None else r[k]) for k in HISTORY_FIELDS})
 
 
 # --------------------------------------------------------------------------- #
@@ -142,7 +180,8 @@ def get_actuals(stations, years, errors):
                 time.sleep(PAUSE_BETWEEN_REQUESTS)
             for rec in data.get("results", []):
                 if rec.get("valid"):
-                    actuals[station][rec["valid"]] = (to_int(rec.get("high")), to_int(rec.get("low")))
+                    actuals[station][rec["valid"]] = (to_int(rec.get("high")), to_int(rec.get("low")),
+                                                      to_precip(rec.get("precip")))
     return actuals
 
 
@@ -158,8 +197,11 @@ def score_day(rows, actuals):
         if not actual or (actual[0] is None and actual[1] is None):
             missing.append(r["city"])
             continue
-        ahi, alo = actual
+        ahi, alo = actual[0], actual[1]
+        apr = actual[2] if len(actual) > 2 else None
         fhi, flo = to_int(r["fc_high"]), to_int(r["fc_low"])
+        fpr = to_precip(r.get("fc_precip"))
+        fpop = to_int(r.get("fc_pop"))
         scored.append({
             "target_date": tdate, "city": r["city"], "station": r["station"],
             "pattern": r.get("pattern", ""),
@@ -167,8 +209,71 @@ def score_day(rows, actuals):
             "err_high": fhi - ahi if fhi is not None and ahi is not None else None,
             "fc_low": flo, "act_low": alo,
             "err_low": flo - alo if flo is not None and alo is not None else None,
+            "fc_precip": fpr, "fc_pop": fpop, "act_precip": apr,
+            "err_precip": (round(fpr - (0.0 if apr < WET_IN else apr), 3)
+                           if fpr is not None and apr is not None else None),
         })
     return scored, missing
+
+
+def precip_stats(rows):
+    """rows: dicts with fc_precip, fc_pop, act_precip (floats/ints or strings)."""
+    called = right = 0
+    amt_err, wet_err, brier = [], [], []
+    for r in rows:
+        f, pop, a = to_precip(r.get("fc_precip")), to_int(r.get("fc_pop")), to_precip(r.get("act_precip"))
+        if a is None:
+            continue
+        wet = a >= WET_IN
+        if pop is not None:
+            called += 1
+            right += (pop >= WET_CALL_PCT) == wet
+            brier.append((pop / 100.0 - (1.0 if wet else 0.0)) ** 2)
+        if f is not None:
+            e = abs(f - (a if wet else 0.0))
+            amt_err.append(e)
+            if wet:
+                wet_err.append(e)
+    return {
+        "called": called, "right": right,
+        "amt_mae": sum(amt_err) / len(amt_err) if amt_err else None,
+        "wet_mae": sum(wet_err) / len(wet_err) if wet_err else None, "n_wet": len(wet_err),
+        "brier": sum(brier) / len(brier) if brier else None,
+    }
+
+
+def precip_table(scored):
+    rows = [r for r in scored if r.get("fc_precip") is not None or r.get("fc_pop") is not None]
+    rows = [r for r in rows if r.get("act_precip") is not None]
+    if not rows:
+        return ""
+    lines = ["Precipitation", f"{'City':<19}{'Fcst':>7}{'Chance':>8}{'Actual':>8}  notes", "-" * 56]
+    shown = 0
+    for r in rows:
+        f, pop, a = r["fc_precip"], r["fc_pop"], r["act_precip"]
+        wet = a >= WET_IN
+        interesting = wet or (pop or 0) >= 30 or (f or 0) >= 0.05
+        if not interesting:
+            continue
+        note = ""
+        if pop is not None:
+            if wet and pop < WET_CALL_PCT:
+                note = "missed it"
+            elif not wet and pop >= WET_CALL_PCT:
+                note = "false alarm"
+        lines.append(f"{r['city'][:18]:<19}{fmt_in(f):>7}{(f'{pop}%' if pop is not None else 'n/a'):>8}{fmt_in(a):>8}  {note}")
+        shown += 1
+    if not shown:
+        lines.append("(dry everywhere, and dry was forecast everywhere)")
+    st = precip_stats(rows)
+    lines.append("-" * 56)
+    if st["called"]:
+        lines.append(f"Rain/no-rain called right: {st['right']} of {st['called']}")
+    if st["amt_mae"] is not None:
+        wet_txt = (f'; on the {st["n_wet"]} wet ones {st["wet_mae"]:.2f}"' if st["n_wet"] else "")
+        lines.append(f'Avg amount miss: {st["amt_mae"]:.2f}" (all cities){wet_txt}')
+    lines.append("(Only cities with rain/snow forecast or observed are listed.)")
+    return "\n".join(lines)
 
 
 def day_table(scored, missing):
@@ -203,6 +308,10 @@ def day_table(scored, missing):
         lines.append(f"Within 3F: {within3} of {len(errs)}")
     if missing:
         lines.append(f"No official report yet: {', '.join(missing)} (will retry tomorrow)")
+    pt = precip_table(scored)
+    if pt:
+        lines.append("")
+        lines.append(pt)
     return "\n".join(lines)
 
 
@@ -228,6 +337,17 @@ def running_summary(history):
     if bias_h and bias_l:
         bh, bl = sum(bias_h) / len(bias_h), sum(bias_l) / len(bias_l)
         out.append(f"  Bias (all time): highs {bh:+.1f}F, lows {bl:+.1f}F  (+ = forecasts run warm)")
+
+    # Precipitation (only rows graded since precipitation was added)
+    for label, days in (("Last 7 days", 7), ("Last 30 days", 30)):
+        rows = [h for h in history if h.get("act_precip") not in (None, "")
+                and h.get("fc_pop") not in (None, "")
+                and date.fromisoformat(h["target_date"]) >= today - timedelta(days=days)]
+        st = precip_stats(rows)
+        if st["called"]:
+            wet = f', wet-day amount miss {st["wet_mae"]:.2f}"' if st["wet_mae"] is not None else ""
+            out.append(f"  Precip, {label.lower()}: rain/no-rain right {st['right']}/{st['called']} "
+                       f"({st['right'] / st['called']:.0%}){wet}")
 
     # Worst cities by combined average miss (needs a few days of data)
     by_city = defaultdict(list)
